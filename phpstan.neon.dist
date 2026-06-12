@@ -1,0 +1,42 @@
+parameters:
+    phpVersion: 80300 # PHP 8.3
+    level: 2
+    bootstrapFiles:
+        - tests/test_tools/phpstan-bootstrap.php
+    paths:
+        - src
+    ignoreErrors:
+        # FFI binds nghttp2_* methods dynamically from the cdef; they are unprovable statically.
+        - '#Call to an undefined method FFI::[a-zA-Z0-9_]+\(\)#'
+        # FFI\CData struct fields (from the cdef) are dynamic and unprovable statically.
+        - '#Access to an undefined property FFI\\CData::\$[a-zA-Z0-9_]+#'
+
+services:
+    -
+        class: Prado\PHPStan\DynamicMethodsClassReflectionExtension
+        tags:
+            - phpstan.broker.methodsClassReflectionExtension
+    -
+        class: Prado\PHPStan\TComponentPropertiesReflectionExtension
+        tags:
+            - phpstan.broker.propertiesClassReflectionExtension
+    -
+        class: Prado\PHPStan\TComponentHasMethodTypeSpecifyingExtension
+        tags:
+            - phpstan.typeSpecifier.methodTypeSpecifyingExtension
+    -
+        class: Prado\PHPStan\TComponentCanGetPropertyTypeSpecifyingExtension
+        tags:
+            - phpstan.typeSpecifier.methodTypeSpecifyingExtension
+    -
+        class: Prado\PHPStan\TComponentCanSetPropertyTypeSpecifyingExtension
+        tags:
+            - phpstan.typeSpecifier.methodTypeSpecifyingExtension
+    -
+        class: Prado\PHPStan\TComponentIsaTypeSpecifyingExtension
+        tags:
+            - phpstan.typeSpecifier.methodTypeSpecifyingExtension
+    -
+        class: Prado\PHPStan\PradoMethodVisibleStaticMethodTypeSpecifyingExtension
+        tags:
+            - phpstan.typeSpecifier.staticMethodTypeSpecifyingExtension

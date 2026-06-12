@@ -1,0 +1,5 @@
+
+http2_library_missing					= Unable to load libnghttp2 for HTTP/2 support. Tried: {0}
+http2_session_failed					= nghttp2 session error: {0}
+http2_session_send_failed				= nghttp2 failed to produce output: {0}
+http2_session_recv_failed				= nghttp2 failed to consume input: {0}

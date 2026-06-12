@@ -10,9 +10,22 @@ jobs:
       matrix:
         php-versions: ['8.1', '8.2', '8.3']
 
+    defaults:
+      run:
+        working-directory: prado-http2
+
     steps:
-      - name: Checkout
+      - name: Checkout extension
         uses: actions/checkout@v4
+        with:
+          path: prado-http2
+
+      - name: Checkout PRADO framework (4.4 dev)
+        uses: actions/checkout@v4
+        with:
+          repository: pradosoft/prado
+          ref: master
+          path: prado.io
 
       - name: Install libnghttp2
         run: sudo apt-get update && sudo apt-get install -y libnghttp2-dev

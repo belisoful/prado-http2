@@ -1,0 +1,67 @@
+{
+	"name": "belisoful/prado-http2",
+	"type": "prado4-extension",
+	"description": "HTTP/2 (RFC 9113) for the PRADO PHP framework, implemented over the system libnghttp2 via FFI. Provides general HTTP/2 sessions and streams; the basis for HTTP/2 servers, clients, and RFC 8441 WebSocket multiplexing.",
+	"keywords": [ "prado", "framework", "http2", "h2", "nghttp2", "rfc9113", "rfc8441", "ffi", "extension"],
+	"homepage": "https://github.com/pradosoft/prado-http2",
+	"license": "BSD-3-Clause",
+	"authors": [
+		{
+			"name": "Brad Anderson",
+			"email": "belisoful@icloud.com",
+			"role": "Developer",
+			"homepage": "https://github.com/belisoful"
+		}
+	],
+	"autoload": {
+		"psr-4": {
+			"Prado\\": "src"
+		}
+	},
+	"repositories": [
+		{
+			"type": "composer",
+			"url": "https://asset-packagist.org"
+		},
+		{
+			"type": "path",
+			"url": "../prado",
+			"options": {
+				"symlink": true,
+				"versions": {
+					"pradosoft/prado": "4.4.0"
+				}
+			}
+		}
+	],
+	"require": {
+		"php": ">=8.1.0",
+		"ext-ffi": "*"
+	},
+	"suggest": {
+		"ext-openssl": "TLS with ALPN 'h2' for HTTP/2 over TLS.",
+		"lib-nghttp2": "The system libnghttp2 shared library, bound via FFI for HTTP/2 framing, HPACK, and flow control."
+	},
+	"require-dev" : {
+		"pradosoft/prado" : "^4.4",
+		"phpunit/phpunit" : "^10",
+		"phpdocumentor/shim": "^3",
+		"friendsofphp/php-cs-fixer": "^3.94",
+		"phpstan/phpstan": "^2.1"
+	},
+	"config": {
+		"platform": {
+			"php": "8.1"
+		},
+		"allow-plugins": {
+			"phpdocumentor/shim": true
+		}
+	},
+	"scripts": {
+		"unittest": "vendor/bin/phpunit --testsuite unit",
+		"functest": "vendor/bin/phpunit --testsuite functional"
+	},
+	"extra": {
+		"bootstrap": "Prado\\IO\\Http2\\THttp2Module"
+	}
+}

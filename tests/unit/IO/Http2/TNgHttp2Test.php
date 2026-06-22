@@ -27,6 +27,13 @@ class TNgHttp2Test extends PHPUnit\Framework\TestCase
 		self::assertNotSame('', TNgHttp2::strerror(-501));
 	}
 
+	public function testStrerrorHandlesNonNegativeCode()
+	{
+		// 0 is NGHTTP2_NO_ERROR ('Success'); strerror returns a PHP string for non-negative codes too.
+		self::assertIsString(TNgHttp2::strerror(0));
+		self::assertNotSame('', TNgHttp2::strerror(0));
+	}
+
 	public function testMissingLibraryThrows()
 	{
 		TNgHttp2::setLibraryPath('/nonexistent/libnghttp2.dylib');

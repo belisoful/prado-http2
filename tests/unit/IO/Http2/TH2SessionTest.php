@@ -251,7 +251,10 @@ class TH2SessionTest extends PHPUnit\Framework\TestCase
 	public function testRequestHeaderBuffersAreFreedNotLeaked()
 	{
 		// Regression: FFI header buffers must be owned (auto-freed) after the submit, not leaked.
-		$pad = str_repeat('a', 4096);
+		// A 16 KB header padding widens the leak signal: leaking every buffer would add ~8 MB over
+		// 500 iterations, so the 1 MB ceiling catches even a partial (>~12%) leak while tolerating
+		// the interpreter's own steady-state noise.
+		$pad = str_repeat('a', 16384);
 		$once = function () use ($pad) {
 			$client = new TH2Session(false);
 			$client->submitSettings([]);
@@ -260,7 +263,9 @@ class TH2SessionTest extends PHPUnit\Framework\TestCase
 			$client->close();
 		};
 
-		$once();                       // warm up one-time allocations
+		for ($i = 0; $i < 50; $i++) {  // warm up one-time allocations to steady state
+			$once();
+		}
 		gc_collect_cycles();
 		$before = memory_get_usage();
 		for ($i = 0; $i < 500; $i++) {
@@ -269,7 +274,6 @@ class TH2SessionTest extends PHPUnit\Framework\TestCase
 		gc_collect_cycles();
 		$growth = memory_get_usage() - $before;
 
-		// A non-owned 4 KB buffer per request would add ~2 MB over 500 iterations; owned buffers stay flat.
 		self::assertLessThan(1_000_000, $growth, 'Per-request FFI header buffers must be freed, not leaked.');
 	}
 
@@ -397,5 +401,299 @@ class TH2SessionTest extends PHPUnit\Framework\TestCase
 		} finally {
 			$client->close();
 		}
+	}
+
+	public function testMarkLocalClosedResumesDeferredStream()
+	{
+		// Regression: respond() then send() defers the data provider (no body queued); a later
+		// markLocalClosed() with no write() must resume the stream so END_STREAM is still emitted.
+		$server = new TH2Session(true);
+		$client = new TH2Session(false);
+		$server->submitSettings([]);
+		$client->submitSettings([]);
+
+		$serverStream = null;
+		$server->attachEventHandler('onRequest', function ($s, $stream) use ($server, &$serverStream) {
+			$server->respond($stream, [':status' => '204']);   // headers only; provider defers
+			$serverStream = $stream;
+		});
+		$closed = false;
+		$client->attachEventHandler('onClose', function () use (&$closed) {
+			$closed = true;
+		});
+
+		$request = $client->request([':method' => 'GET', ':scheme' => 'http', ':authority' => 'h', ':path' => '/']);
+		$request->markLocalClosed();
+
+		$server->receive($client->send());        // server emits HEADERS, then provideData defers DATA
+		$client->receive($server->send());
+
+		self::assertInstanceOf(TH2Stream::class, $serverStream);
+		self::assertFalse($closed, 'The stream is still open while the provider is deferred.');
+
+		$serverStream->markLocalClosed();           // finish an empty body with no preceding write()
+		for ($i = 0; $i < 8 && !$closed; $i++) {
+			$server->receive($client->send());
+			$client->receive($server->send());
+		}
+		self::assertTrue($closed, 'markLocalClosed() resumed the deferred stream and ended it.');
+
+		$server->close();
+		$client->close();
+	}
+
+	public function testInformationalResponsePrecedesFinalResponse()
+	{
+		// RFC 9113: a 1xx informational response (e.g. 103 Early Hints) raises onInformationalResponse,
+		// distinct from the final response's onResponse.
+		$server = new TH2Session(true);
+		$client = new TH2Session(false);
+		$server->submitSettings([]);
+		$client->submitSettings([]);
+
+		$server->attachEventHandler('onRequest', function ($s, $stream) use ($server) {
+			$server->respond($stream, [':status' => '103', 'link' => '</style.css>; rel=preload']);
+			$server->respond($stream, [':status' => '200']);
+			$stream->markLocalClosed();
+		});
+
+		$sequence = [];
+		$client->attachEventHandler('onInformationalResponse', function ($s, $stream) use (&$sequence) {
+			$sequence[] = 'info:' . $stream->getHeader(':status');
+		});
+		$client->attachEventHandler('onResponse', function ($s, $stream) use (&$sequence) {
+			$sequence[] = 'final:' . $stream->getHeader(':status');
+		});
+
+		$request = $client->request([':method' => 'GET', ':scheme' => 'http', ':authority' => 'h', ':path' => '/']);
+		$request->markLocalClosed();
+		for ($i = 0; $i < 8; $i++) {
+			$server->receive($client->send());
+			$client->receive($server->send());
+		}
+
+		self::assertSame(['info:103', 'final:200'], $sequence, 'The 1xx arrived as informational, then the final 200.');
+		$server->close();
+		$client->close();
+	}
+
+	public function testServerSendsTrailersClientReceivesThem()
+	{
+		$server = new TH2Session(true);
+		$client = new TH2Session(false);
+		$server->submitSettings([]);
+		$client->submitSettings([]);
+
+		$server->attachEventHandler('onRequest', function ($s, $stream) use ($server) {
+			$server->respond($stream, [':status' => '200', 'content-type' => 'application/grpc']);
+			$stream->write('payload');
+			$stream->sendTrailers(['grpc-status' => '0', 'x-checksum' => 'abc123']);
+		});
+
+		$body = '';
+		$trailerStatus = null;
+		$sawTrailers = false;
+		$sawResponse = false;
+		$client->attachEventHandler('onResponse', function () use (&$sawResponse) {
+			$sawResponse = true;
+		});
+		$client->attachEventHandler('onData', function ($s, $stream) use (&$body) {
+			$body .= $stream->getContents();
+		});
+		$client->attachEventHandler('onTrailers', function ($s, $stream) use (&$sawTrailers, &$trailerStatus) {
+			$sawTrailers = true;
+			$trailerStatus = $stream->getHeader('grpc-status');
+		});
+
+		$request = $client->request([':method' => 'POST', ':scheme' => 'http', ':authority' => 'h', ':path' => '/rpc']);
+		$request->markLocalClosed();
+		for ($i = 0; $i < 8; $i++) {
+			$server->receive($client->send());
+			$client->receive($server->send());
+		}
+
+		self::assertTrue($sawResponse, 'The final response headers arrived.');
+		self::assertSame('payload', $body, 'The body arrived before the trailers.');
+		self::assertTrue($sawTrailers, 'The trailing header block raised onTrailers.');
+		self::assertSame('0', $trailerStatus, 'The trailer value merged into the stream headers.');
+		$server->close();
+		$client->close();
+	}
+
+	public function testGetLocalSettingReflectsAdvertisedSetting()
+	{
+		$server = new TH2Session(true);
+		$client = new TH2Session(false);
+		$server->submitSettings([TNgHttp2::SETTINGS_ENABLE_CONNECT_PROTOCOL => 1]);
+		$client->submitSettings([]);
+
+		self::assertSame(0, $server->getLocalSetting(TNgHttp2::SETTINGS_ENABLE_CONNECT_PROTOCOL), 'Not yet in effect.');
+		for ($i = 0; $i < 3; $i++) {
+			$client->receive($server->send());
+			$server->receive($client->send());
+		}
+		self::assertSame(1, $server->getLocalSetting(TNgHttp2::SETTINGS_ENABLE_CONNECT_PROTOCOL), 'In effect after the SETTINGS flush.');
+
+		$server->close();
+		$client->close();
+	}
+
+	public function testSubmitWindowUpdateDoesNotThrow()
+	{
+		$client = new TH2Session(false);
+		$client->submitSettings([]);
+		$client->submitWindowUpdate(0, 65535);          // connection-level
+		self::assertNotSame('', $client->send(), 'A WINDOW_UPDATE is queued for the transport.');
+		$client->close();
+	}
+
+	public function testConsumeAdvancesManualFlowControl()
+	{
+		$options = new \Prado\IO\Http2\TH2Options();
+		$options->setNoAutoWindowUpdate(true);
+		$server = new TH2Session(true, $options);
+		$client = new TH2Session(false);
+		$server->submitSettings([]);
+		$client->submitSettings([]);
+
+		$consumedBytes = 0;
+		$server->attachEventHandler('onRequest', function ($s, $stream) use ($server) {
+			$server->respond($stream, [':status' => '200']);
+			$stream->markLocalClosed();
+		});
+		$server->attachEventHandler('onData', function ($s, $stream) use ($server, &$consumedBytes) {
+			$bytes = strlen($stream->getContents());
+			$server->consume($stream->getStreamId(), $bytes);   // manual flow-control accounting
+			$consumedBytes += $bytes;
+		});
+
+		$request = $client->request([':method' => 'POST', ':scheme' => 'http', ':authority' => 'h', ':path' => '/']);
+		$request->write('payload-bytes');
+		$request->markLocalClosed();
+		for ($i = 0; $i < 8; $i++) {
+			$server->receive($client->send());
+			$client->receive($server->send());
+		}
+
+		self::assertSame(strlen('payload-bytes'), $consumedBytes, 'The server consumed the received DATA under manual flow control.');
+		$server->close();
+		$client->close();
+	}
+
+	public function testPingWithEmptyPayloadRoundTrips()
+	{
+		$server = new TH2Session(true);
+		$client = new TH2Session(false);
+		$server->submitSettings([]);
+		$client->submitSettings([]);
+
+		$serverSentPing = false;
+		$server->attachEventHandler('onFrameSent', function ($s, $info) use (&$serverSentPing) {
+			if ($info['type'] === TNgHttp2::FRAME_PING) {
+				$serverSentPing = true;
+			}
+		});
+
+		$client->ping();                                  // the zero-payload default branch
+		$server->receive($client->send());
+		$client->receive($server->send());
+		self::assertTrue($serverSentPing, 'A zero-payload PING is answered with a PING ACK.');
+
+		$server->close();
+		$client->close();
+	}
+
+	public function testGoawaySenderCannotRequest()
+	{
+		$client = new TH2Session(false);
+		$client->submitSettings([]);
+		self::assertTrue($client->isRequestAllowed(), 'Requests allowed initially.');
+		$client->goaway(TNgHttp2::NO_ERROR);
+		self::assertFalse($client->isRequestAllowed(), 'The GOAWAY sender opens no new requests.');
+		$client->close();
+	}
+
+	public function testSubmitSettingsRejectsInvalidValue()
+	{
+		$server = new TH2Session(true);
+		// ENABLE_PUSH must be 0 or 1; nghttp2 rejects 2 with INVALID_ARGUMENT.
+		$this->expectException(THttp2Exception::class);
+		try {
+			$server->submitSettings([TNgHttp2::SETTINGS_ENABLE_PUSH => 2]);
+		} finally {
+			$server->close();
+		}
+	}
+
+	public function testSessionErrorRaisedOnConnectionSpecificHeader()
+	{
+		// RFC 9113 forbids connection-specific headers in HTTP/2; the server reports a session error.
+		$server = new TH2Session(true);
+		$client = new TH2Session(false);
+		$server->submitSettings([]);
+		$client->submitSettings([]);
+
+		$errorMessage = null;
+		$server->attachEventHandler('onSessionError', function ($s, $message) use (&$errorMessage) {
+			$errorMessage = $message;
+		});
+
+		$client->request([':method' => 'GET', ':scheme' => 'http', ':authority' => 'h', ':path' => '/', 'connection' => 'keep-alive']);
+		for ($i = 0; $i < 4; $i++) {
+			$server->receive($client->send());
+			$client->receive($server->send());
+		}
+
+		self::assertIsString($errorMessage, 'onSessionError delivered nghttp2 message string.');
+		self::assertNotSame('', $errorMessage);
+		$server->close();
+		$client->close();
+	}
+
+	public function testFrameNotSentRaisedWhenRespondingAfterReset()
+	{
+		$server = new TH2Session(true);
+		$client = new TH2Session(false);
+		$server->submitSettings([]);
+		$client->submitSettings([]);
+
+		$serverStream = null;
+		$server->attachEventHandler('onRequest', function ($s, $stream) use (&$serverStream) {
+			$serverStream = $stream;
+		});
+		$notSent = null;
+		$server->attachEventHandler('onFrameNotSent', function ($s, $info) use (&$notSent) {
+			$notSent = $info;
+		});
+
+		$request = $client->request([':method' => 'GET', ':scheme' => 'http', ':authority' => 'h', ':path' => '/']);
+		$server->receive($client->send());        // server opens the stream
+		$request->cancel();                          // client RST_STREAM
+		$server->receive($client->send());        // server sees the reset
+
+		$server->respond($serverStream, [':status' => '200']);   // queued for a now-closed stream
+		for ($i = 0; $i < 4; $i++) {
+			$client->receive($server->send());
+			$server->receive($client->send());
+		}
+
+		self::assertIsArray($notSent, 'onFrameNotSent fired for the response on the reset stream.');
+		self::assertArrayHasKey('error', $notSent, 'The payload carries the nghttp2 error code.');
+		$server->close();
+		$client->close();
+	}
+
+	public function testInvalidFrameEventDispatchesToHandler()
+	{
+		// onInvalidFrame fires from the on_invalid_frame_recv callback; assert its event plumbing
+		// and payload shape directly (a natural protocol trigger is version-dependent).
+		$session = new TH2Session(true);
+		$received = null;
+		$session->attachEventHandler('onInvalidFrame', function ($s, $info) use (&$received) {
+			$received = $info;
+		});
+		$session->onInvalidFrame(['type' => TNgHttp2::FRAME_HEADERS, 'streamId' => 3, 'flags' => 0, 'error' => -531]);
+		self::assertSame(['type' => TNgHttp2::FRAME_HEADERS, 'streamId' => 3, 'flags' => 0, 'error' => -531], $received);
+		$session->close();
 	}
 }

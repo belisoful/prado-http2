@@ -8,15 +8,15 @@ use PhpCsFixer\Finder;
 $finder = PhpCsFixer\Finder::create()
 	->exclude('.git/')
 	->exclude('docs/')
-	->exclude('tests/')
 	->exclude('vendor/')
+	->exclude('agents/')
 	->in(__DIR__);
 
 $config = new PhpCsFixer\Config();
 $config
 	->setRiskyAllowed(true)
-    ->setIndent("\t")
-    ->setLineEnding("\n")
+	->setIndent("\t")
+	->setLineEnding("\n")
 	->setRules([
 		'@PSR12' => true,
 		'@PHP8x2Migration' => true,

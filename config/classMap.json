@@ -1,0 +1,7 @@
+{
+	"TNgHttp2": "Prado\\IO\\Http2\\TNgHttp2",
+	"TH2Session": "Prado\\IO\\Http2\\TH2Session",
+	"TH2Stream": "Prado\\IO\\Http2\\TH2Stream",
+	"TH2Options": "Prado\\IO\\Http2\\TH2Options",
+	"THttp2Exception": "Prado\\IO\\Http2\\THttp2Exception"
+}

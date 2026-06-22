@@ -1,9 +1,9 @@
 <?php
+
 /**
  * A few common settings for all unit tests.
  *
- * Also remember do define the @package attribute for your test class to make it appear under
- * the right package in unit test and code coverage reports.
+ * Loads the Composer autoloader so PHPStan can resolve the framework and extension classes.
  */
 
-require_once(__DIR__ . '/../../vendor/autoload.php');
+require_once __DIR__ . '/../../vendor/autoload.php';

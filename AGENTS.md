@@ -41,8 +41,8 @@
 - Docblocks are technical, present tense, American English. Banned: antithesis ("not X, it Ys"), em-dash dramatic asides, editorializing/filler, rule-of-three lists. One fact per sentence; prefer subject-verb-object and `condition → result`.
 
 ### Error Handling
-- Throw `Prado\IO\Http2\THttp2Exception` (extends `TIOException`) for HTTP/2 failures, using error codes from `src/IO/Http2/errorMessages.txt` (`http2_*`). `errorMessages.txt` is for display text only; code throws the code.
-- `errorMessages.txt` is registered automatically by `THttp2Module` (it extends `TPluginModule`); the framework `messages.txt` is not used.
+- Throw `Prado\IO\Http2\THttp2Exception` (extends `TIOException`) for HTTP/2 failures, using error codes from `config/errorMessages.txt` (`http2_*`). `errorMessages.txt` is for display text only; code throws the code.
+- `config/errorMessages.txt` is registered system-wide through the `extra.prado.error-messages` entry in composer.json; the framework `messages.txt` is not used.
 - `TNgHttp2::isAvailable()` returns false (rather than throwing) when `libnghttp2` cannot load, so callers can fall back to HTTP/1.1.
 
 ### Imports
@@ -52,17 +52,17 @@
 
 - **libnghttp2 is a system library** resolved at runtime: explicit `TNgHttp2::setLibraryPath()` → `PRADO_NGHTTP2_LIB` env → platform defaults. It is a composer `suggest`/runtime concern, not a hard install requirement of the package.
 - **Memory I/O.** A `TH2Session` is transport-agnostic: `receive($bytes)` feeds the session, `send()` drains its output. Pump these over any transport.
-- **Callbacks** are PHP closures kept alive on the session (`$_refs`); each session has its own callback set, so two sessions in one process never cross-talk.
-- **Data providers** pull outgoing DATA from per-stream queues; deferred until a write resumes the stream. Use `TH2Stream::markLocalClosed()` to finish a finite body (flush then END_STREAM); `close()` tears the stream down.
+- **Callbacks** are PHP closures built **once** and shared by every session, kept alive process-wide in the static `$_sharedRefs` (a closure handed to FFI lives for the FFI instance's life, so per-session closures would leak); each session captures the shared provider/closures (`$_dataProvider`, `$_refs`). Routing to the owning session is via nghttp2's `user_data`, so two sessions never cross-talk.
+- **Data providers** pull outgoing DATA from per-stream queues; deferred until the stream resumes. `TH2Stream::markLocalClosed()` finishes a finite body (flush then END_STREAM) and resumes the stream so a deferred provider re-arms; `sendTrailers()` ends with a trailing header block; `close()` tears the stream down.
 - **The cdef** in `TNgHttp2` is the only place C declarations live. Extend it there when binding more of the nghttp2 API.
-- **FFI gotchas**: call `cast()`/`new()` on the bound instance (`$ffi->cast(...)`); `FFI::addr`/`string`/`memcpy` are static; a `const char*` return arrives as a PHP string.
+- **FFI gotchas**: call `cast()`/`new()` on the bound instance (`$ffi->cast(...)`); `FFI::addr`/`string`/`memcpy` are static; a `const char*` arrives as a PHP string both as a return value and as a callback parameter (e.g. `error_callback2`'s `msg`), while a `uint8_t*` stays CData and needs `FFI::string($ptr, $len)`.
 - **phpstan** cannot prove FFI's dynamic methods or CData fields — `phpstan.neon.dist` ignores `Call to an undefined method FFI::...` and `Access to an undefined property FFI\CData::...`. Keep these.
 - **cs-fixer uses tabs** (`@PSR12` + `setIndent("\t")`). If it wants to reformat every file to spaces, the `.php-cs-fixer.dist.php` was replaced by a scaffold (`@auto`); restore the tab config.
 - **Out of scope**: HTTP/3 (QUIC needs TLS hooks PHP lacks); TLS/ALPN (the caller's job); web-SAPI hosting (use a long-running process).
 
 ### Framework conventions in use
 - All classes here extend `TComponent` (or a `Prado\Util`/`Prado\IO` base). Events use the `on` prefix (`onRequest`, `onData`), raised with `raiseEvent('onX', $sender, $param)`. There are no `dy`/`fx` dynamic or global events in this extension.
-- `THttp2Module` is the `extra.bootstrap` module (a `TPluginModule`).
+- The extension has no bootstrap module; it declares `extra.prado.error-messages` (`config/errorMessages.txt`) and `extra.prado.class-map` (`config/classMap.json`) in composer.json, both registered system-wide (read by `TApplicationConfiguration`).
 
 ## Testing Guidelines
 - The testing platform is PHPUnit. All new code must include unit tests asserting typical and edge cases, including error/exception handling.

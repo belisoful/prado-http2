@@ -37,7 +37,6 @@ The library is resolved in this order: an explicit path set with `TNgHttp2::setL
 | `Prado\IO\Http2\TH2Stream` | One HTTP/2 stream as a duplex PSR-7 `StreamInterface`: carries headers, buffers incoming DATA, queues outgoing DATA, and can `cancel()` |
 | `Prado\IO\Http2\TH2Options` | Optional session tuning (`PeerMaxConcurrentStreams`, `NoAutoWindowUpdate`), applied at creation |
 | `Prado\IO\Http2\THttp2Exception` | An HTTP/2 failure (library missing, session error); extends `TIOException` |
-| `Prado\IO\Http2\THttp2Module` | The `extra.bootstrap` module (a `TPluginModule`); auto-registers the extension's `http2_*` error codes |
 
 ## Architecture
 
@@ -48,7 +47,7 @@ your transport (socket, test pipe, ...)
    TH2Session::receive()  ──► libnghttp2 ──►  TH2Session::send()
         │  (framing, HPACK, flow control via nghttp2)
         ▼  events
-   onRequest / onResponse / onData / onClose
+   onRequest / onResponse / onInformationalResponse / onTrailers / onData / onClose
         │
         ▼
    TH2Stream  (one per HTTP/2 stream — a duplex StreamInterface)
@@ -73,6 +72,7 @@ $session->attachEventHandler('onRequest', function ($session, $stream) {
     // $stream->getHeaders() includes the pseudo-headers (:method, :path, :authority, ...)
     $session->respond($stream, [':status' => '200']);
     $stream->write('hello');
+    $stream->markLocalClosed();                  // finish the body — emits END_STREAM
 });
 $session->attachEventHandler('onData', function ($session, $stream) {
     $body = $stream->getContents();              // bytes received on this stream
@@ -96,7 +96,13 @@ $session = new TH2Session(false);                // client side
 $session->submitSettings([]);
 
 $session->attachEventHandler('onResponse', function ($session, $stream) {
-    $status = $stream->getHeader(':status');
+    $status = $stream->getHeader(':status');     // the final (non-1xx) response
+});
+$session->attachEventHandler('onInformationalResponse', function ($session, $stream) {
+    // a 1xx response (100 Continue, 103 Early Hints) before the final response
+});
+$session->attachEventHandler('onTrailers', function ($session, $stream) {
+    // a trailing header block after the body (e.g. grpc-status)
 });
 $session->attachEventHandler('onData', function ($session, $stream) {
     $body = $stream->getContents();
@@ -108,6 +114,7 @@ $stream = $session->request([
     ':authority' => 'example.com',
     ':path'      => '/',
 ]);
+$stream->markLocalClosed();                      // a GET has no body — end the request
 
 $transport->write($session->send());             // preface + SETTINGS + request
 $session->receive($transport->read(65536));
@@ -115,7 +122,9 @@ $session->receive($transport->read(65536));
 
 ### Streaming and Extended CONNECT
 
-`TH2Stream` is a full PSR-7 `StreamInterface` (`write()` queues outgoing DATA and resumes the stream; `read()`/`getContents()` return buffered incoming DATA; it is **not** seekable). This supports request/response bodies and long-lived tunnels alike. An RFC 8441 Extended CONNECT (`:method` `CONNECT`, `:protocol` `websocket`) opens a bidirectional stream that carries arbitrary bytes both ways — the basis for WebSocket-over-HTTP/2.
+`TH2Stream` is a full PSR-7 `StreamInterface` (`write()` queues outgoing DATA and resumes the stream; `read()`/`getContents()` return buffered incoming DATA; it is **not** seekable). Per PSR-7 it throws when written to after it is local-closed/closed, or read after it is closed/detached. This supports request/response bodies and long-lived tunnels alike. An RFC 8441 Extended CONNECT (`:method` `CONNECT`, `:protocol` `websocket`) opens a bidirectional stream that carries arbitrary bytes both ways — the basis for WebSocket-over-HTTP/2.
+
+A finite body is finished two ways: `markLocalClosed()` flushes the queued bytes and ends the stream (END_STREAM), and `sendTrailers([...])` flushes the body and then ends the stream with a trailing header block (HTTP/2 trailers, e.g. `grpc-status`). `close()` instead discards the buffers and detaches the stream.
 
 ### Connection control and tuning
 
@@ -137,13 +146,18 @@ Tuning is passed at creation: `new TH2Session(true, (new TH2Options())->setPeerM
 
 ## PRADO integration
 
-Register the bootstrap module so the `http2_*` error codes resolve (already wired via `extra.bootstrap` for composer-installed extensions):
+The package declares its Prado metadata under `extra.prado` in composer.json (the format `TApplicationConfiguration` reads):
 
-```xml
-<modules>
-    <module id="http2" class="Prado\IO\Http2\THttp2Module" />
-</modules>
+```json
+"extra": {
+    "prado": {
+        "error-messages": "config/errorMessages.txt",
+        "class-map": "config/classMap.json"
+    }
+}
 ```
+
+`error-messages` registers the `http2_*` codes and `class-map` registers the short class name → FQN map, both system-wide for every installed extension, so they resolve with no further wiring. The extension has no bootstrap module — nothing else to configure.
 
 ## Limitations
 

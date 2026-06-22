@@ -26,7 +26,9 @@ use Psr\Http\Message\StreamInterface;
  * throws.  Reads are non-blocking: {@see read()} returns the buffered bytes, or '' when none
  * have arrived yet.  The stream is at {@see eof()} once the peer half-closes and the buffer is
  * drained.  {@see markLocalClosed()} finishes a finite body: the queued bytes flush and the
- * stream then ends (END_STREAM), unlike {@see close()}, which discards the buffers.
+ * stream then ends (END_STREAM), unlike {@see close()}, which discards the buffers and leaves
+ * the stream detached.  A {@see read()}, {@see getContents()}, or {@see write()} on a detached
+ * stream throws, per PSR-7.
  *
  * State is self-encapsulated: every field is reached through a protected `get*Direct()`/
  * `set*Direct()` accessor (the byte buffers return by reference), so a subclass can intercept
@@ -58,6 +60,15 @@ class TH2Stream extends TComponent implements StreamInterface
 
 	/** @var bool Whether this side has finished writing (no more outgoing DATA). */
 	private bool $_localClosed = false;
+
+	/** @var bool Whether the stream has been closed or detached (unusable per PSR-7). */
+	private bool $_detached = false;
+
+	/** @var bool Whether a trailing header block is queued to send after the body. */
+	private bool $_trailersPending = false;
+
+	/** @var array<string, string> The trailing headers to send once the body finishes. */
+	private array $_trailers = [];
 
 	/** @var int The total number of bytes read, for {@see tell()}. */
 	private int $_readPosition = 0;
@@ -188,6 +199,60 @@ class TH2Stream extends TComponent implements StreamInterface
 	}
 
 	/**
+	 * Returns the raw detached flag.
+	 * @return bool Whether the stream has been closed or detached.
+	 */
+	protected function getDetachedDirect(): bool
+	{
+		return $this->_detached;
+	}
+
+	/**
+	 * Sets the raw detached flag.
+	 * @param bool $value Whether the stream has been closed or detached.
+	 */
+	protected function setDetachedDirect(bool $value): void
+	{
+		$this->_detached = $value;
+	}
+
+	/**
+	 * Returns the raw trailers-pending flag.
+	 * @return bool Whether a trailing header block is queued.
+	 */
+	protected function getTrailersPendingDirect(): bool
+	{
+		return $this->_trailersPending;
+	}
+
+	/**
+	 * Sets the raw trailers-pending flag.
+	 * @param bool $value Whether a trailing header block is queued.
+	 */
+	protected function setTrailersPendingDirect(bool $value): void
+	{
+		$this->_trailersPending = $value;
+	}
+
+	/**
+	 * Returns the raw trailing headers.
+	 * @return array<string, string> The queued trailing headers.
+	 */
+	protected function getTrailersDirect(): array
+	{
+		return $this->_trailers;
+	}
+
+	/**
+	 * Sets the raw trailing headers.
+	 * @param array<string, string> $value The trailing headers.
+	 */
+	protected function setTrailersDirect(array $value): void
+	{
+		$this->_trailers = $value;
+	}
+
+	/**
 	 * Returns the raw read position.
 	 * @return int The total bytes read.
 	 */
@@ -284,10 +349,48 @@ class TH2Stream extends TComponent implements StreamInterface
 	 * Marks this side as done writing: the data provider sends any queued outgoing bytes and then
 	 * ends the stream (END_STREAM).  Unlike {@see close()}, the queued buffer is preserved and
 	 * still flushed.  Use this to finish a finite response or request body.
+	 *
+	 * The stream is resumed so nghttp2 re-arms its data provider: a stream whose provider was
+	 * already deferred (an open stream with nothing queued, e.g. a server `respond()` then
+	 * `send()` with no body) would otherwise never emit END_STREAM.
 	 */
 	public function markLocalClosed(): void
 	{
 		$this->setLocalClosedDirect(true);
+		$this->getSessionDirect()->resumeStream($this->getStreamIdDirect());
+	}
+
+	/** @return bool Whether a trailing header block is queued to send after the body. */
+	public function hasTrailersPending(): bool
+	{
+		return $this->getTrailersPendingDirect();
+	}
+
+	/**
+	 * Returns the queued trailing headers and clears the pending flag.  Called by the session's
+	 * data provider once the body finishes, to submit the trailers exactly once.
+	 * @return array<string, string> The trailing headers.
+	 */
+	public function consumeTrailers(): array
+	{
+		$this->setTrailersPendingDirect(false);
+		return $this->getTrailersDirect();
+	}
+
+	/**
+	 * Finishes the body with a trailing header block (HTTP/2 trailers): the queued bytes flush as
+	 * DATA, then the trailers are sent as a HEADERS frame with END_STREAM.  Trailers carry no
+	 * pseudo-headers (no `:status`).  Call after {@see write()}ing the body, instead of
+	 * {@see markLocalClosed()}.  The trailers are submitted by the data provider once the body has
+	 * drained, as nghttp2 requires.
+	 * @param array<string, string> $headers The trailing header name => value pairs.
+	 */
+	public function sendTrailers(array $headers): void
+	{
+		$this->setTrailersDirect($headers);
+		$this->setTrailersPendingDirect(true);
+		$this->setLocalClosedDirect(true);
+		$this->getSessionDirect()->resumeStream($this->getStreamIdDirect());
 	}
 
 	/**
@@ -315,10 +418,17 @@ class TH2Stream extends TComponent implements StreamInterface
 	/**
 	 * Queues bytes for outgoing DATA frames and resumes the stream so nghttp2 sends them.
 	 * @param string $string The bytes to send.
+	 * @throws \RuntimeException When the stream is not writable (closed, detached, or local-closed).
 	 * @return int The number of bytes queued.
 	 */
 	public function write(string $string): int
 	{
+		if ($this->getDetachedDirect()) {
+			throw new \RuntimeException('Cannot write to a detached or closed HTTP/2 stream.');
+		}
+		if ($this->getLocalClosedDirect()) {
+			throw new \RuntimeException('Cannot write to a non-writable HTTP/2 stream; the local side is closed.');
+		}
 		$outgoing = &$this->getOutgoingDirect();
 		$outgoing .= $string;
 		$this->getSessionDirect()->resumeStream($this->getStreamIdDirect());
@@ -326,14 +436,22 @@ class TH2Stream extends TComponent implements StreamInterface
 	}
 
 	/**
-	 * Returns up to $length buffered incoming bytes (non-blocking).
+	 * Returns up to $length buffered incoming bytes (non-blocking).  An open stream with nothing
+	 * buffered returns '' rather than blocking.
 	 * @param int $length The maximum number of bytes to return.
+	 * @throws \RuntimeException When the stream is detached/closed, or $length is negative.
 	 * @return string The bytes read, or '' when none are buffered.
 	 */
 	public function read(int $length): string
 	{
+		if ($this->getDetachedDirect()) {
+			throw new \RuntimeException('Cannot read from a detached or closed HTTP/2 stream.');
+		}
+		if ($length < 0) {
+			throw new \RuntimeException('Length parameter cannot be negative.');
+		}
 		$incoming = &$this->getIncomingDirect();
-		if ($length <= 0 || $incoming === '') {
+		if ($length === 0 || $incoming === '') {
 			return '';
 		}
 		$bytes = substr($incoming, 0, $length);
@@ -344,10 +462,14 @@ class TH2Stream extends TComponent implements StreamInterface
 
 	/**
 	 * Returns and clears all buffered incoming bytes.
+	 * @throws \RuntimeException When the stream is detached or closed.
 	 * @return string The buffered incoming bytes.
 	 */
 	public function getContents(): string
 	{
+		if ($this->getDetachedDirect()) {
+			throw new \RuntimeException('Cannot read from a detached or closed HTTP/2 stream.');
+		}
 		$incoming = &$this->getIncomingDirect();
 		$bytes = $incoming;
 		$incoming = '';
@@ -356,12 +478,14 @@ class TH2Stream extends TComponent implements StreamInterface
 	}
 
 	/**
-	 * Closes the stream for both directions and clears its buffers.
+	 * Closes the stream for both directions and clears its buffers.  The stream becomes unusable:
+	 * a later {@see read()}, {@see getContents()}, or {@see write()} throws (PSR-7).
 	 */
 	public function close(): void
 	{
 		$this->setLocalClosedDirect(true);
 		$this->setRemoteClosedDirect(true);
+		$this->setDetachedDirect(true);
 		$this->setIncomingDirect('');
 		$this->setOutgoingDirect('');
 	}
@@ -394,16 +518,17 @@ class TH2Stream extends TComponent implements StreamInterface
 		return $this->getReadPositionDirect();
 	}
 
-	/** @return bool Whether incoming bytes can be read (true until closed). */
+	/** @return bool Whether incoming bytes can be read (true until detached and drained). */
 	public function isReadable(): bool
 	{
-		return !$this->getRemoteClosedDirect() || $this->getIncomingDirect() !== '';
+		return !$this->getDetachedDirect()
+			&& (!$this->getRemoteClosedDirect() || $this->getIncomingDirect() !== '');
 	}
 
-	/** @return bool Whether bytes can be written (true until this side closes). */
+	/** @return bool Whether bytes can be written (true until this side closes or detaches). */
 	public function isWritable(): bool
 	{
-		return !$this->getLocalClosedDirect();
+		return !$this->getDetachedDirect() && !$this->getLocalClosedDirect();
 	}
 
 	/** @return bool Always false; an HTTP/2 stream is not seekable. */
@@ -443,11 +568,17 @@ class TH2Stream extends TComponent implements StreamInterface
 	}
 
 	/**
-	 * Returns and clears the buffered incoming bytes.
+	 * Returns and clears the buffered incoming bytes.  Casting consumes the buffer (an HTTP/2
+	 * stream is not seekable, so the bytes cannot be re-read).  Per PSR-7 this never throws: a
+	 * detached or closed stream casts to ''.
 	 * @return string The buffered incoming bytes.
 	 */
 	public function __toString(): string
 	{
-		return $this->getContents();
+		try {
+			return $this->getContents();
+		} catch (\Throwable $e) {
+			return '';
+		}
 	}
 }

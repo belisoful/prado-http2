@@ -39,8 +39,7 @@ class TH2StreamTest extends PHPUnit\Framework\TestCase
 		self::assertSame(0, $stream->tell());
 		self::assertSame('abc', $stream->read(3));         // capped to length
 		self::assertSame(3, $stream->tell());
-		self::assertSame('', $stream->read(0), 'A non-positive length reads nothing.');
-		self::assertSame('', $stream->read(-5));
+		self::assertSame('', $stream->read(0), 'A zero length reads nothing.');
 		self::assertSame('def', $stream->read(100), 'A length over the buffer returns what is there.');
 		self::assertSame('', $stream->read(10), 'An empty buffer reads nothing.');
 		self::assertSame(6, $stream->tell());
@@ -93,10 +92,53 @@ class TH2StreamTest extends PHPUnit\Framework\TestCase
 		$stream->pushIncoming('in');
 		$stream->write('out');
 		$stream->close();
-		self::assertSame('', $stream->read(10));
 		self::assertFalse($stream->hasOutgoing());
 		self::assertTrue($stream->eof());
-		self::assertFalse($stream->isWritable());
+		self::assertFalse($stream->isWritable(), 'A closed stream is not writable.');
+		self::assertFalse($stream->isReadable(), 'A closed stream is not readable.');
+	}
+
+	public function testReadAfterCloseThrows()
+	{
+		$stream = $this->stream();
+		$stream->pushIncoming('in');
+		$stream->close();
+		$this->expectException(\RuntimeException::class);
+		$stream->read(10);
+	}
+
+	public function testGetContentsAfterCloseThrows()
+	{
+		$stream = $this->stream();
+		$stream->pushIncoming('in');
+		$stream->close();
+		$this->expectException(\RuntimeException::class);
+		$stream->getContents();
+	}
+
+	public function testWriteAfterCloseThrows()
+	{
+		$stream = $this->stream();
+		$stream->close();
+		$this->expectException(\RuntimeException::class);
+		$stream->write('x');
+	}
+
+	public function testWriteAfterMarkLocalClosedThrows()
+	{
+		$stream = $this->stream();
+		$stream->markLocalClosed();
+		self::assertFalse($stream->isWritable(), 'A local-closed stream is not writable.');
+		$this->expectException(\RuntimeException::class);
+		$stream->write('late');
+	}
+
+	public function testReadNegativeLengthThrows()
+	{
+		$stream = $this->stream();
+		$stream->pushIncoming('data');
+		$this->expectException(\RuntimeException::class);
+		$stream->read(-1);
 	}
 
 	public function testDetachClosesAndReturnsNull()
@@ -105,6 +147,30 @@ class TH2StreamTest extends PHPUnit\Framework\TestCase
 		$stream->pushIncoming('in');
 		self::assertNull($stream->detach());
 		self::assertTrue($stream->eof());
+		self::assertFalse($stream->isReadable(), 'A detached stream is not readable.');
+		self::assertFalse($stream->isWritable(), 'A detached stream is not writable.');
+	}
+
+	public function testToStringOnDetachedStreamReturnsEmpty()
+	{
+		$stream = $this->stream();
+		$stream->pushIncoming('body');
+		$stream->close();
+		self::assertSame('', (string) $stream, 'Casting a closed stream never throws; it yields an empty string.');
+	}
+
+	public function testMarkLocalClosedPreservesQueuedBytesUnlikeClose()
+	{
+		$stream = $this->stream();
+		$stream->write('body');
+		$stream->markLocalClosed();
+		self::assertTrue($stream->hasOutgoing(), 'markLocalClosed() keeps the queued body to flush.');
+		self::assertSame('body', $stream->drainOutgoing(100));
+
+		$other = $this->stream();
+		$other->write('body');
+		$other->close();
+		self::assertFalse($other->hasOutgoing(), 'close() discards the queued body.');
 	}
 
 	public function testToStringDrainsIncoming()

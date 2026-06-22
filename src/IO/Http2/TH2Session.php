@@ -39,7 +39,9 @@ use Prado\TComponent;
  *
  * Stream events ('on' prefix), each raised with the session as sender and the {@see TH2Stream} as param:
  *  - onRequest: a server request stream's headers are complete.
- *  - onResponse: a client request's response headers arrived.
+ *  - onResponse: a client request's final (non-1xx) response headers arrived.
+ *  - onInformationalResponse: a client received a 1xx informational response (100, 103, ...).
+ *  - onTrailers: a client received a trailing header block (HEADERS after the body, no `:status`).
  *  - onData: DATA arrived on a stream (read it via the stream).
  *  - onClose: a stream closed.
  *
@@ -99,6 +101,12 @@ class TH2Session extends TComponent
 
 	/** @var ?TH2Options The tuning options applied at creation. */
 	private ?TH2Options $_options = null;
+
+	/** @var ?\FFI\CData The data provider this session submits with (the shared one at creation). */
+	private ?\FFI\CData $_dataProvider = null;
+
+	/** @var array<int, mixed> The callback closures this session uses, held alive for its life. */
+	private array $_refs = [];
 
 	/**
 	 * @param bool $isServer Whether this is the server side. Default true.
@@ -232,6 +240,33 @@ class TH2Session extends TComponent
 		$this->_options = $value;
 	}
 
+	/** @return ?\FFI\CData The data provider this session submits with. */
+	protected function getDataProviderDirect(): ?\FFI\CData
+	{
+		return $this->_dataProvider;
+	}
+
+	/** @param ?\FFI\CData $value The data provider this session submits with. */
+	protected function setDataProviderDirect(?\FFI\CData $value): void
+	{
+		$this->_dataProvider = $value;
+	}
+
+	/**
+	 * Returns the session's callback closures by reference (held alive for the session's life).
+	 * @return array<int, mixed> The callback closures, by reference.
+	 */
+	protected function &getRefsDirect(): array
+	{
+		return $this->_refs;
+	}
+
+	/** @param array<int, mixed> $value The callback closures. */
+	protected function setRefsDirect(array $value): void
+	{
+		$this->_refs = $value;
+	}
+
 	// =========================================================================
 	// Session Setup
 	// =========================================================================
@@ -293,7 +328,9 @@ class TH2Session extends TComponent
 			return 0;
 		};
 		$onError = static function ($session, $libError, $msg, $len, $userData) {
-			self::fromUserData($userData)?->onSessionError(\FFI::string($msg, $len));
+			// FFI converts the const char* `msg` to a PHP string; some builds yield CData instead.
+			$message = is_string($msg) ? $msg : \FFI::string($msg, $len);
+			self::fromUserData($userData)?->onSessionError($message);
 			return 0;
 		};
 		$ffi->nghttp2_session_callbacks_set_on_frame_send_callback($callbacks, $onFrameSend);
@@ -341,6 +378,11 @@ class TH2Session extends TComponent
 	{
 		$ffi = $this->getFfiDirect();
 		$callbacks = self::sharedCallbacks($ffi);
+		// Capture the provider and closures this session was built with, so a later
+		// TNgHttp2::setLibraryPath() rebuild (new FFI, new shared statics) cannot strand it on a
+		// foreign provider: request()/respond() submit with this captured provider, not the static.
+		$this->setDataProviderDirect(self::$_provider);
+		$this->setRefsDirect(self::$_sharedRefs);
 
 		$this->setIdDirect(self::$_nextId++);
 		self::$_registry[$this->getIdDirect()] = $this;
@@ -449,7 +491,7 @@ class TH2Session extends TComponent
 	{
 		$keep = [];
 		$nva = $this->buildHeaders($headers, $keep);
-		$streamId = $this->getFfiDirect()->nghttp2_submit_request2($this->getSessionDirect(), null, $nva, count($headers), \FFI::addr(self::$_provider), null);
+		$streamId = $this->getFfiDirect()->nghttp2_submit_request2($this->getSessionDirect(), null, $nva, count($headers), \FFI::addr($this->getDataProviderDirect()), null);
 		if ($streamId < 0) {
 			throw new THttp2Exception('http2_session_failed', TNgHttp2::strerror($streamId));
 		}
@@ -469,7 +511,25 @@ class TH2Session extends TComponent
 	{
 		$keep = [];
 		$nva = $this->buildHeaders($headers, $keep);
-		$result = $this->getFfiDirect()->nghttp2_submit_response2($this->getSessionDirect(), $stream->getStreamId(), $nva, count($headers), \FFI::addr(self::$_provider));
+		$result = $this->getFfiDirect()->nghttp2_submit_response2($this->getSessionDirect(), $stream->getStreamId(), $nva, count($headers), \FFI::addr($this->getDataProviderDirect()));
+		if ($result !== 0) {
+			throw new THttp2Exception('http2_session_failed', TNgHttp2::strerror($result));
+		}
+	}
+
+	/**
+	 * Submits a trailing header block on a stream, sent after the body as a HEADERS frame with
+	 * END_STREAM.  Called by {@see TH2Stream::sendTrailers()}; the stream's data provider then ends
+	 * the body without END_STREAM so the trailers carry it.
+	 * @param int $streamId The stream identifier.
+	 * @param array<string, string> $headers The trailing header name => value pairs.
+	 * @throws THttp2Exception When the trailers cannot be submitted.
+	 */
+	public function submitTrailers(int $streamId, array $headers): void
+	{
+		$keep = [];
+		$nva = $this->buildHeaders($headers, $keep);
+		$result = $this->getFfiDirect()->nghttp2_submit_trailer($this->getSessionDirect(), $streamId, $nva, count($headers));
 		if ($result !== 0) {
 			throw new THttp2Exception('http2_session_failed', TNgHttp2::strerror($result));
 		}
@@ -500,7 +560,10 @@ class TH2Session extends TComponent
 	}
 
 	/**
-	 * Resumes a deferred stream so nghttp2 pulls its newly queued outgoing DATA.
+	 * Resumes a deferred stream so nghttp2 pulls its newly queued outgoing DATA.  The return code is
+	 * intentionally ignored: nghttp2 returns `NGHTTP2_ERR_INVALID_ARGUMENT` when the stream is not
+	 * currently deferred, which is the normal case for a write to an already-active stream, not a
+	 * failure.  Resuming is best-effort and idempotent.
 	 * @param int $streamId The stream identifier.
 	 */
 	public function resumeStream(int $streamId): void
@@ -661,6 +724,8 @@ class TH2Session extends TComponent
 		unset(self::$_registry[$this->getIdDirect()]);
 		$this->setStreamsDirect([]);
 		$this->setUserDataDirect(null);
+		$this->setDataProviderDirect(null);
+		$this->setRefsDirect([]);
 	}
 
 	/**
@@ -727,11 +792,19 @@ class TH2Session extends TComponent
 			} else {
 				$stream = $streams[$streamId] ?? null;
 				if ($stream !== null) {
+					$frameStatus = $headers[':status'] ?? null;
+					$priorStatus = $stream->getHeader(':status');
 					$stream->mergeHeaders($headers);
 					if ($endStream) {
 						$stream->markRemoteClosed();
 					}
-					$this->onResponse($stream);
+					if ($frameStatus !== null && $frameStatus !== '' && $frameStatus[0] === '1') {
+						$this->onInformationalResponse($stream);
+					} elseif ($frameStatus === null && $priorStatus !== null) {
+						$this->onTrailers($stream);
+					} else {
+						$this->onResponse($stream);
+					}
 				}
 			}
 		} elseif ($frame->type === TNgHttp2::FRAME_DATA && $endStream) {
@@ -790,6 +863,14 @@ class TH2Session extends TComponent
 		}
 		if (!$stream->hasOutgoing()) {
 			if ($stream->isLocalClosed()) {
+				if ($stream->hasTrailersPending()) {
+					// EOF ends the body; NO_END_STREAM holds END_STREAM back so the trailers carry
+					// it.  nghttp2 requires the trailers be submitted from inside this callback,
+					// after the body has drained.
+					$dataFlags[0] = TNgHttp2::DATA_FLAG_EOF | TNgHttp2::DATA_FLAG_NO_END_STREAM;
+					$this->submitTrailers($streamId, $stream->consumeTrailers());
+					return 0;
+				}
 				$dataFlags[0] = TNgHttp2::DATA_FLAG_EOF;
 				return 0;
 			}
@@ -850,12 +931,34 @@ class TH2Session extends TComponent
 	}
 
 	/**
-	 * Raised when a client request's response headers arrive.
+	 * Raised when a client request's final response headers arrive (a non-1xx `:status`).  A 1xx
+	 * informational response raises {@see onInformationalResponse} instead, and a trailing header
+	 * block raises {@see onTrailers}.
 	 * @param TH2Stream $stream The stream carrying the response.
 	 */
 	public function onResponse(TH2Stream $stream): void
 	{
 		$this->raiseEvent('onResponse', $this, $stream);
+	}
+
+	/**
+	 * Raised when a client receives a 1xx informational response (e.g. 100 Continue, 103 Early
+	 * Hints) before the final response.  The stream stays open; {@see onResponse} follows.
+	 * @param TH2Stream $stream The stream carrying the informational response.
+	 */
+	public function onInformationalResponse(TH2Stream $stream): void
+	{
+		$this->raiseEvent('onInformationalResponse', $this, $stream);
+	}
+
+	/**
+	 * Raised when a client receives a trailing header block (a HEADERS frame after the response
+	 * body, carrying no `:status`).  The trailers are merged into the stream's headers.
+	 * @param TH2Stream $stream The stream carrying the trailers.
+	 */
+	public function onTrailers(TH2Stream $stream): void
+	{
+		$this->raiseEvent('onTrailers', $this, $stream);
 	}
 
 	/**

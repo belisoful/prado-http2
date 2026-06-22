@@ -62,6 +62,9 @@
 		"functest": "vendor/bin/phpunit --testsuite functional"
 	},
 	"extra": {
-		"bootstrap": "Prado\\IO\\Http2\\THttp2Module"
+		"prado": {
+			"error-messages": "config/errorMessages.txt",
+			"class-map": "config/classMap.json"
+		}
 	}
 }

@@ -5,6 +5,7 @@ parameters:
         - tests/test_tools/phpstan-bootstrap.php
     paths:
         - src
+        - tests
     ignoreErrors:
         # FFI binds nghttp2_* methods dynamically from the cdef; they are unprovable statically.
         - '#Call to an undefined method FFI::[a-zA-Z0-9_]+\(\)#'

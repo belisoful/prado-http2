@@ -43,17 +43,19 @@ Five classes under `Prado\IO\Http2` (`src/IO/Http2/`):
 | Class | Role |
 |---|---|
 | `TNgHttp2` | `final` FFI binding: library resolution, the C-declaration (`cdef`) surface, `version()`/`isAvailable()`/`strerror()`, and protocol constants |
-| `TH2Session` | one HTTP/2 connection (server or client): owns the nghttp2 session, manages streams, moves bytes with `receive()`/`send()`, raises `onRequest`/`onResponse`/`onData`/`onClose` |
+| `TH2Session` | one HTTP/2 connection (server or client): owns the nghttp2 session, manages streams, moves bytes with `receive()`/`send()`, raises `onRequest`/`onResponse`/`onInformationalResponse`/`onTrailers`/`onData`/`onClose` |
 | `TH2Stream` | one stream as a duplex PSR-7 `StreamInterface`: headers, incoming/outgoing buffers |
+| `TH2Options` | optional session tuning (`PeerMaxConcurrentStreams`, `NoAutoWindowUpdate`), applied at creation |
 | `THttp2Exception` | an HTTP/2 failure; extends `TIOException` |
-| `THttp2Module` | the `extra.bootstrap` module; extends `TPluginModule`, which auto-registers the adjacent `errorMessages.txt` |
+
+The extension has no bootstrap module. `config/errorMessages.txt` (the `http2_*` codes) and `config/classMap.json` (short class name → FQN) load system-wide through the `extra.prado.error-messages` and `extra.prado.class-map` entries in composer.json.
 
 ### How nghttp2 is driven
 
 - **Memory I/O.** A session never touches a socket. Feed received bytes with `receive()`; drain produced bytes with `send()`. The same code runs over a real socket or an in-process test pipe — which is why the unit tests need neither sockets nor TLS.
-- **Callbacks.** Each `TH2Session` builds its own nghttp2 callback set wired to PHP closures, held alive in `$_refs` for the session's life. Two sessions in one process never cross-talk.
-- **Data providers.** Outgoing DATA is pulled by one shared nghttp2 data-provider callback from each stream's queued bytes; an empty but open stream returns `ERR_DEFERRED` until a write resumes it. `TH2Stream::markLocalClosed()` finishes a finite body (flush the queue, then END_STREAM), unlike `close()` which tears the buffers down.
-- **FFI quirks.** Call `cast()`/`new()` on the bound instance (`$ffi->cast(...)`), since phpstan treats them as instance methods; `FFI::addr`/`string`/`memcpy` are static. FFI converts a `const char*` **return value** to a PHP string (handled in `TNgHttp2::strerror()`).
+- **Callbacks.** The nghttp2 callback set (and data provider) is built **once** and shared by every session, with the closures held alive process-wide in the static `$_sharedRefs` — a closure handed to FFI is retained for the FFI instance's life, so per-session closures would leak. Each session captures the shared provider/closures (`$_dataProvider`, `$_refs`) so a `setLibraryPath()` re-bind cannot strand it. Routing to the owning session is through nghttp2's `user_data` (a per-session id in `$_registry`), so two sessions in one process never cross-talk.
+- **Data providers.** Outgoing DATA is pulled by the shared nghttp2 data-provider callback from each stream's queued bytes; an empty but open stream returns `ERR_DEFERRED` until resumed. `TH2Stream::markLocalClosed()` finishes a finite body (flush the queue, then END_STREAM) and **resumes the stream** so a deferred provider re-arms; `sendTrailers()` flushes the body then ends the stream with a trailing header block; `close()` tears the buffers down.
+- **FFI quirks.** Call `cast()`/`new()` on the bound instance (`$ffi->cast(...)`), since phpstan treats them as instance methods; `FFI::addr`/`string`/`memcpy` are static. FFI converts a `const char*` to a PHP string both as a **return value** (handled in `TNgHttp2::strerror()`) and as a **callback parameter** (the `error_callback2` `msg`, handled in the `onError` closure); a `uint8_t*` stays CData and needs `FFI::string($ptr, $len)`.
 
 ### Library resolution
 
@@ -80,7 +82,7 @@ Five classes under `Prado\IO\Http2` (`src/IO/Http2/`):
 ## Important Rules
 
 - **Namespace** `Prado\IO\Http2`, PSR-4 → `src/`. Extensions do **not** maintain the framework's `classes.php` — composer PSR-4 autoloading covers the classes.
-- **Error codes** are `http2_*` in `src/IO/Http2/errorMessages.txt`, registered automatically by `THttp2Module` (it extends `TPluginModule`, whose `getErrorFile()` resolves the file next to the module). The framework `messages.txt` is not used. New codes describe the failure; `{0}`, `{1}` are positional parameters.
+- **Error codes** are `http2_*` in `config/errorMessages.txt`, registered system-wide through the `extra.prado.error-messages` entry in composer.json (read by `TApplicationConfiguration`). The framework `messages.txt` is not used. New codes describe the failure; `{0}`, `{1}` are positional parameters. The `config/classMap.json` short-name → FQN map loads the same way via `extra.prado.class-map`.
 - **Self-Encapsulation (UAP-SE)** is required for `TComponent` classes: private fields, protected `get*Direct()`/`set*Direct()` accessors (return **by reference** for mutable buffers/arrays, like `TBufferStream`), and **all** access — public accessors and internal code — routed through them. `TH2Session` and `TH2Stream` follow this. `TNgHttp2` is a `final` static binding with no instance property system and is exempt.
 - **phpstan + FFI.** FFI binds nghttp2 methods and CData struct fields dynamically, so they are unprovable statically. `phpstan.neon.dist` carries `ignoreErrors` for `Call to an undefined method FFI::...` and `Access to an undefined property FFI\CData::...` — keep them; do not silence individual lines with casts or `@var`.
 - **cs-fixer = tabs** (`@PSR12` + `setIndent("\t")`). If cs-fixer suddenly wants to convert tabs → spaces across *every* file, `.php-cs-fixer.dist.php` has been clobbered by a php-cs-fixer scaffold (the `@auto` default); restore the tab-based config (it matches the sibling extensions).

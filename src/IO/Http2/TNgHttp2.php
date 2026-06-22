@@ -135,6 +135,7 @@ final class TNgHttp2
 		int nghttp2_submit_settings(nghttp2_session *session, uint8_t flags, const nghttp2_settings_entry *iv, size_t niv);
 		int nghttp2_submit_response2(nghttp2_session *session, int32_t stream_id, const nghttp2_nv *nva, size_t nvlen, const nghttp2_data_provider2 *data_prd);
 		int32_t nghttp2_submit_request2(nghttp2_session *session, const void *pri_spec, const nghttp2_nv *nva, size_t nvlen, const nghttp2_data_provider2 *data_prd, void *stream_user_data);
+		int nghttp2_submit_trailer(nghttp2_session *session, int32_t stream_id, const nghttp2_nv *nva, size_t nvlen);
 		nghttp2_ssize nghttp2_session_mem_send2(nghttp2_session *session, const uint8_t **data_ptr);
 		nghttp2_ssize nghttp2_session_mem_recv2(nghttp2_session *session, const uint8_t *in, size_t inlen);
 		int nghttp2_session_want_read(nghttp2_session *session);

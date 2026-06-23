@@ -38,7 +38,7 @@ Run these in order — all must pass:
 
 ## Architecture
 
-Five classes under `Prado\IO\Http2` (`src/IO/Http2/`):
+Six classes under `Prado\IO\Http2` (`src/IO/Http2/`):
 
 | Class | Role |
 |---|---|
@@ -46,6 +46,7 @@ Five classes under `Prado\IO\Http2` (`src/IO/Http2/`):
 | `TH2Session` | one HTTP/2 connection (server or client): owns the nghttp2 session, manages streams, moves bytes with `receive()`/`send()`, raises `onRequest`/`onResponse`/`onInformationalResponse`/`onTrailers`/`onData`/`onClose` |
 | `TH2Stream` | one stream as a duplex PSR-7 `StreamInterface`: headers, incoming/outgoing buffers |
 | `TH2Options` | optional session tuning (`PeerMaxConcurrentStreams`, `NoAutoWindowUpdate`), applied at creation |
+| `TH2Alpn` | `final` static helper: advertises the `h2` ALPN protocol in an `ssl` context and reads back the negotiated protocol (TLS termination stays the caller's) |
 | `THttp2Exception` | an HTTP/2 failure; extends `TIOException` |
 
 The extension has no bootstrap module. `config/errorMessages.txt` (the `http2_*` codes) and `config/classMap.json` (short class name → FQN) load system-wide through the `extra.prado.error-messages` and `extra.prado.class-map` entries in composer.json.
@@ -64,7 +65,7 @@ The extension has no bootstrap module. `config/errorMessages.txt` (the `http2_*`
 ### Out of scope
 
 - **HTTP/3 (RFC 9220).** Runs over QUIC, whose TLS key schedule needs hooks PHP's OpenSSL bindings do not expose. No viable pure-PHP or FFI-simple path.
-- **TLS / ALPN.** This layer frames HTTP/2 only. Serving `h2` over TLS (terminating TLS, negotiating the `h2` ALPN protocol) is the caller's responsibility. Cleartext `h2c` needs nothing extra.
+- **TLS termination.** Certificates, cipher policy, and the listen/accept loop are the caller's responsibility (often a reverse proxy). `TH2Alpn` covers the one HTTP/2-specific TLS step — negotiating the `h2` ALPN protocol via PHP's OpenSSL streams — and the caller pumps the TLS stream's bytes into `receive()`/`send()`. Cleartext `h2c` needs no TLS.
 - **Web SAPIs.** A request-scoped SAPI (PHP-FPM, mod_php) cannot expose the raw socket; use this in a long-running process.
 
 ## Naming Conventions

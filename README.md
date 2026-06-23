@@ -36,6 +36,7 @@ The library is resolved in this order: an explicit path set with `TNgHttp2::setL
 | `Prado\IO\Http2\TH2Session` | One HTTP/2 connection (server or client): drives nghttp2, manages streams, moves bytes with `receive()`/`send()`, exposes connection control (`resetStream`/`goaway`/`ping`/settings/flow control), and raises stream and diagnostic events |
 | `Prado\IO\Http2\TH2Stream` | One HTTP/2 stream as a duplex PSR-7 `StreamInterface`: carries headers, buffers incoming DATA, queues outgoing DATA, and can `cancel()` |
 | `Prado\IO\Http2\TH2Options` | Optional session tuning (`PeerMaxConcurrentStreams`, `NoAutoWindowUpdate`), applied at creation |
+| `Prado\IO\Http2\TH2Alpn` | TLS/ALPN helper: advertises `h2` in an `ssl` stream context and reads the negotiated protocol back (needs `ext-openssl`) |
 | `Prado\IO\Http2\THttp2Exception` | An HTTP/2 failure (library missing, session error); extends `TIOException` |
 
 ## Architecture
@@ -159,10 +160,33 @@ The package declares its Prado metadata under `extra.prado` in composer.json (th
 
 `error-messages` registers the `http2_*` codes and `class-map` registers the short class name → FQN map, both system-wide for every installed extension, so they resolve with no further wiring. The extension has no bootstrap module — nothing else to configure.
 
+## TLS with ALPN (`h2`)
+
+Browsers speak HTTP/2 only over TLS, negotiated through the `h2` ALPN protocol (RFC 9113 §3.3). `TH2Alpn` supplies the two HTTP/2-specific pieces; PHP's OpenSSL stream layer terminates the TLS connection, and the session stays transport-agnostic.
+
+```php
+use Prado\IO\Http2\TH2Alpn;
+use Prado\IO\Http2\TH2Session;
+
+$ctx = stream_context_create(['ssl' => TH2Alpn::sslOptions([
+    'local_cert' => '/path/server.pem',
+])]);
+$listen = stream_socket_server('tls://0.0.0.0:443', $errno, $errstr,
+    STREAM_SERVER_BIND | STREAM_SERVER_LISTEN, $ctx);
+
+$conn = stream_socket_accept($listen);   // TLS handshake completes here
+TH2Alpn::requireH2($conn);               // confirm the peer negotiated h2
+
+$session = new TH2Session(true);
+// ... pump fread($conn) -> $session->receive(); fwrite($conn, $session->send()) ...
+```
+
+A client mirrors this with `stream_socket_client('tls://...')` and `TH2Alpn::negotiatedH2($conn)` to fall back to HTTP/1.1 when `h2` is not offered. Certificates and cipher policy remain the caller's concern.
+
 ## Limitations
 
 - **HTTP/3 is out of scope.** HTTP/3 runs over QUIC, whose TLS key schedule needs hooks PHP's OpenSSL bindings do not expose; there is no usable pure-PHP or FFI-simple path today.
-- **TLS/ALPN is the caller's responsibility.** This extension frames HTTP/2; serving `h2` over TLS means terminating TLS on the socket and negotiating the `h2` ALPN protocol before handing bytes to a session. Cleartext `h2c` needs no TLS.
+- **Full TLS termination is the caller's responsibility.** Certificates, cipher policy, and the listen/accept loop belong to the caller (often a reverse proxy). `TH2Alpn` handles the one HTTP/2-specific TLS step, negotiating the `h2` ALPN protocol (see [TLS with ALPN](#tls-with-alpn-h2)); the caller then pumps the TLS stream into a session. Cleartext `h2c` needs no TLS.
 - **Not a web-SAPI module.** A request-scoped SAPI (PHP-FPM, mod_php) does not expose the raw socket; use this in a long-running process.
 
 ## Development

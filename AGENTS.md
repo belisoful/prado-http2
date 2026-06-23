@@ -58,7 +58,8 @@
 - **FFI gotchas**: call `cast()`/`new()` on the bound instance (`$ffi->cast(...)`); `FFI::addr`/`string`/`memcpy` are static; a `const char*` arrives as a PHP string both as a return value and as a callback parameter (e.g. `error_callback2`'s `msg`), while a `uint8_t*` stays CData and needs `FFI::string($ptr, $len)`.
 - **phpstan** cannot prove FFI's dynamic methods or CData fields — `phpstan.neon.dist` ignores `Call to an undefined method FFI::...` and `Access to an undefined property FFI\CData::...`. Keep these.
 - **cs-fixer uses tabs** (`@PSR12` + `setIndent("\t")`). If it wants to reformat every file to spaces, the `.php-cs-fixer.dist.php` was replaced by a scaffold (`@auto`); restore the tab config.
-- **Out of scope**: HTTP/3 (QUIC needs TLS hooks PHP lacks); TLS/ALPN (the caller's job); web-SAPI hosting (use a long-running process).
+- **TLS/ALPN**: `TH2Alpn` advertises the `h2` ALPN protocol in an `ssl` stream context and reads the negotiated protocol back (needs `ext-openssl`). Full TLS termination (certs, ciphers, the accept loop) stays the caller's job; cleartext `h2c` needs no TLS.
+- **Out of scope**: HTTP/3 (QUIC needs TLS key-schedule hooks PHP lacks); full TLS termination; web-SAPI hosting (use a long-running process).
 
 ### Framework conventions in use
 - All classes here extend `TComponent` (or a `Prado\Util`/`Prado\IO` base). Events use the `on` prefix (`onRequest`, `onData`), raised with `raiseEvent('onX', $sender, $param)`. There are no `dy`/`fx` dynamic or global events in this extension.

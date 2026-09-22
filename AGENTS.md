@@ -7,8 +7,8 @@
 - **Unit tests**: `composer unittest` (`vendor/bin/phpunit --testsuite unit`) — two in-process nghttp2 sessions, no sockets/TLS.
 - **Functional tests**: `composer functest` (`vendor/bin/phpunit --testsuite functional`) — `curl --http2-prior-knowledge` interop over a real socket.
 - **Test filter**: `vendor/bin/phpunit --testsuite unit --filter <function|class>`.
-- **PHPStan**: `vendor/bin/phpstan analyse src/ --memory-limit=512M`.
-- **PHP CS Fixer**: `vendor/bin/php-cs-fixer fix --dry-run src/` (check) / `vendor/bin/php-cs-fixer fix src/` (apply).
+- **PHPStan**: `vendor/bin/phpstan analyse --memory-limit=512M` (level 3, PHP 8.1 to 8.5, over `src/` and `tests/`).
+- **PHP CS Fixer**: `vendor/bin/php-cs-fixer fix --dry-run` (check) / `vendor/bin/php-cs-fixer fix` (apply); covers `src/` and `tests/`.
 - **Install / update deps**: `composer install` / `composer update`.
 - A **full check** is, in order: `php -l` compile → php-cs-fixer → phpstan → phpunit (`unittest`, then `functest` where `libnghttp2` + curl are present). All must pass before a commit.
 - NEVER add or change phpunit command options; only run the `unittest`/`functest` scripts. When testing one class or cluster, run only its tests via `--filter`.
@@ -16,7 +16,7 @@
 ## Code Style Guidelines
 
 ### PHP Coding Standards
-- PHP 8.1 minimum (CI: 8.1, 8.2, 8.3). PSR-12 via php-cs-fixer.
+- PHP 8.1 minimum (CI: 8.1, 8.2, 8.3, 8.4, 8.5). PSR-12 via php-cs-fixer.
 - Indentation: **1 tab**, never spaces. Line endings: Unix (`\n`). All files begin with `<?php`.
 - `if` always has a `{}` block (no single-line bodies).
 - Use `?` for single nullable types and in doc blocks.
@@ -37,7 +37,7 @@
 ### Documentation Standards
 - Every public method has a PHPDoc block with `@param`/`@return`/`@throws` as applicable, plus at least one descriptive sentence.
 - Classes have a clear top docblock (what/why/how, an example where useful) with `@author` and `@since`.
-- `@since` uses the current version (`1.0.0`).
+- `@since` uses the current version (`1.1.0`).
 - Docblocks are technical, present tense, American English. Banned: antithesis ("not X, it Ys"), em-dash dramatic asides, editorializing/filler, rule-of-three lists. One fact per sentence; prefer subject-verb-object and `condition → result`.
 
 ### Error Handling
@@ -52,8 +52,11 @@
 
 - **libnghttp2 is a system library** resolved at runtime: explicit `TNgHttp2::setLibraryPath()` → `PRADO_NGHTTP2_LIB` env → platform defaults. It is a composer `suggest`/runtime concern, not a hard install requirement of the package.
 - **Memory I/O.** A `TH2Session` is transport-agnostic: `receive($bytes)` feeds the session, `send()` drains its output. Pump these over any transport.
-- **Callbacks** are PHP closures built **once** and shared by every session, kept alive process-wide in the static `$_sharedRefs` (a closure handed to FFI lives for the FFI instance's life, so per-session closures would leak); each session captures the shared provider/closures (`$_dataProvider`, `$_refs`). Routing to the owning session is via nghttp2's `user_data`, so two sessions never cross-talk.
+- **Callbacks** are PHP closures built **once** and shared by every session, kept alive process-wide in the static `$_sharedRefs` (a closure handed to FFI lives for the FFI instance's life, so per-session closures would leak); each session captures the shared provider/closures (`$_dataProvider`, `$_refs`). Routing to the owning session is via nghttp2's `user_data` through the FFI instance the closures were built with, so two sessions never cross-talk. The routing registry holds `WeakReference`s, so an unreferenced session is collected and its `__destruct` closes it.
 - **Data providers** pull outgoing DATA from per-stream queues; deferred until the stream resumes. `TH2Stream::markLocalClosed()` finishes a finite body (flush then END_STREAM) and resumes the stream so a deferred provider re-arms; `sendTrailers()` ends with a trailing header block; `close()` tears the stream down.
+- **Closed state.** `TH2Session::close()` frees the nghttp2 session and marks the remaining streams closed (`TH2Stream::markClosed()`); every later nghttp2 call throws `http2_session_closed` (`resumeStream()`/`wantsIo()` degrade quietly). A peer reset or completion marks the stream closed the same way before `onClose`.
+- **Headers.** Names are lowercased on submit; a repeated received field joins (`cookie` with `; `, others with `, `). A second HEADERS on a stream raises `onTrailers` on both server and client.
+- **The cdef mirrors `nghttp2.h`**: `nghttp2_ssize` is `ptrdiff_t`, struct fields keep the header's order.
 - **The cdef** in `TNgHttp2` is the only place C declarations live. Extend it there when binding more of the nghttp2 API.
 - **FFI gotchas**: call `cast()`/`new()` on the bound instance (`$ffi->cast(...)`); `FFI::addr`/`string`/`memcpy` are static; a `const char*` arrives as a PHP string both as a return value and as a callback parameter (e.g. `error_callback2`'s `msg`), while a `uint8_t*` stays CData and needs `FFI::string($ptr, $len)`.
 - **phpstan** cannot prove FFI's dynamic methods or CData fields — `phpstan.neon.dist` ignores `Call to an undefined method FFI::...` and `Access to an undefined property FFI\CData::...`. Keep these.
@@ -73,7 +76,7 @@
 ## Development Environment
 - PHP 8.1+; extensions: ffi (required), openssl (h2 over TLS), plus the framework's ctype, dom, intl, json, pcre, spl.
 - System library: `libnghttp2` (bound via FFI).
-- `pradosoft/prado ^4.4` is a dev dependency; the IO layer it provides is 4.4 (unreleased), so Packagist-resolved CI is red until 4.4 ships.
+- `pradosoft/prado ^4.4` is a dev dependency. 4.4 is unreleased, so composer.json resolves it from the sibling `../prado` path repository and CI checks out `pradosoft/prado@master` there (weekly scheduled run included).
 - Composer for dependency management; presume dependencies are installed.
 
 # PRADO Framework Agent Safeguards — ANTI-PATTERNS

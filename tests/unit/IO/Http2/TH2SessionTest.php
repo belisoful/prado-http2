@@ -696,4 +696,216 @@ class TH2SessionTest extends PHPUnit\Framework\TestCase
 		self::assertSame(['type' => TNgHttp2::FRAME_HEADERS, 'streamId' => 3, 'flags' => 0, 'error' => -531], $received);
 		$session->close();
 	}
+
+
+	public function testClosedSessionRejectsNghttp2Calls()
+	{
+		$client = new TH2Session(false);
+		$client->submitSettings([]);
+		$stream = $client->request([':method' => 'GET', ':scheme' => 'http', ':authority' => 'h', ':path' => '/']);
+		$client->close();
+
+		self::assertFalse($client->wantsIo(), 'A closed session wants no I/O.');
+		$client->resumeStream($stream->getStreamId());   // a no-op on a closed session, not a use-after-free
+		self::assertFalse($stream->isWritable(), 'Closing the session marks its streams closed.');
+		self::assertTrue($stream->isLocalClosed());
+		self::assertTrue($stream->eof());
+
+		$calls = [
+			'send' => fn () => $client->send(),
+			'receive' => fn () => $client->receive('x'),
+			'submitSettings' => fn () => $client->submitSettings([]),
+			'request' => fn () => $client->request([':method' => 'GET', ':scheme' => 'http', ':authority' => 'h', ':path' => '/']),
+			'respond' => fn () => $client->respond($stream, [':status' => '200']),
+			'submitTrailers' => fn () => $client->submitTrailers($stream->getStreamId(), []),
+			'resetStream' => fn () => $client->resetStream($stream->getStreamId()),
+			'goaway' => fn () => $client->goaway(),
+			'ping' => fn () => $client->ping(),
+			'isRequestAllowed' => fn () => $client->isRequestAllowed(),
+			'submitWindowUpdate' => fn () => $client->submitWindowUpdate(0, 1),
+			'consume' => fn () => $client->consume($stream->getStreamId(), 1),
+			'getRemoteSetting' => fn () => $client->getRemoteSetting(TNgHttp2::SETTINGS_MAX_CONCURRENT_STREAMS),
+			'getLocalSetting' => fn () => $client->getLocalSetting(TNgHttp2::SETTINGS_MAX_CONCURRENT_STREAMS),
+		];
+		foreach ($calls as $name => $call) {
+			try {
+				$call();
+				self::fail("$name() on a closed session did not throw.");
+			} catch (THttp2Exception $e) {
+				self::assertStringContainsString('closed', $e->getMessage(), "$name() reports the closed session.");
+			}
+		}
+	}
+
+	public function testSessionIsCollectedOnceUnreferenced()
+	{
+		$client = new TH2Session(false);
+		$client->submitSettings([]);
+		$client->send();
+		$weak = \WeakReference::create($client);
+		unset($client);
+		gc_collect_cycles();
+		self::assertNull($weak->get(), 'The registry holds sessions weakly, so an unreferenced session is collected and its nghttp2 session freed.');
+	}
+
+	public function testClientSendsTrailersServerReceivesThem()
+	{
+		$server = new TH2Session(true);
+		$client = new TH2Session(false);
+		$server->submitSettings([]);
+		$client->submitSettings([]);
+
+		$requests = 0;
+		$body = '';
+		$trailer = null;
+		$eofOnTrailers = null;
+		$server->attachEventHandler('onRequest', function () use (&$requests) {
+			$requests++;
+		});
+		$server->attachEventHandler('onData', function ($s, $stream) use (&$body) {
+			$body .= $stream->getContents();
+		});
+		$server->attachEventHandler('onTrailers', function ($s, $stream) use (&$trailer, &$eofOnTrailers) {
+			$trailer = $stream->getHeader('x-checksum');
+			$eofOnTrailers = $stream->eof();
+		});
+
+		$request = $client->request([':method' => 'POST', ':scheme' => 'http', ':authority' => 'h', ':path' => '/upload']);
+		$request->write('payload');
+		$request->sendTrailers(['x-checksum' => 'abc123']);
+		for ($i = 0; $i < 8; $i++) {
+			$server->receive($client->send());
+			$client->receive($server->send());
+		}
+
+		self::assertSame(1, $requests, 'The trailing HEADERS did not raise a second onRequest.');
+		self::assertSame('payload', $body, 'The body arrived before the trailers.');
+		self::assertSame('abc123', $trailer, 'The server merged the request trailers into the stream headers.');
+		self::assertTrue($eofOnTrailers, 'The trailers carried END_STREAM.');
+		$server->close();
+		$client->close();
+	}
+
+	public function testRepeatedRequestHeadersAreJoined()
+	{
+		// Only a raw nghttp2 client can send a repeated field (TH2Session headers are a name => value
+		// map); the TH2Session server keeps every value.
+		$server = new TH2Session(true);
+		$server->submitSettings([]);
+		$headers = null;
+		$server->attachEventHandler('onRequest', function ($s, $stream) use (&$headers) {
+			$headers = $stream->getHeaders();
+		});
+
+		$ffi = TNgHttp2::ffi();
+		$cbs = $ffi->new('nghttp2_session_callbacks*');
+		$ffi->nghttp2_session_callbacks_new(\FFI::addr($cbs));
+		$client = $ffi->new('nghttp2_session*');
+		$ffi->nghttp2_session_client_new(\FFI::addr($client), $cbs, null);
+		$ffi->nghttp2_submit_settings($client, 0, null, 0);
+
+		$pairs = [
+			[':method', 'GET'], [':scheme', 'http'], [':authority', 'h'], [':path', '/'],
+			['cookie', 'a=1'], ['cookie', 'b=2'], ['x-tag', 'one'], ['x-tag', 'two'],
+		];
+		$nva = $ffi->new('nghttp2_nv[' . count($pairs) . ']');
+		$keep = [];
+		foreach ($pairs as $i => [$name, $value]) {
+			$nameBuf = $ffi->new('uint8_t[' . (strlen($name) + 1) . ']');
+			$valueBuf = $ffi->new('uint8_t[' . (strlen($value) + 1) . ']');
+			\FFI::memcpy($nameBuf, $name, strlen($name));
+			\FFI::memcpy($valueBuf, $value, strlen($value));
+			$nva[$i]->name = $ffi->cast('uint8_t*', $nameBuf);
+			$nva[$i]->value = $ffi->cast('uint8_t*', $valueBuf);
+			$nva[$i]->namelen = strlen($name);
+			$nva[$i]->valuelen = strlen($value);
+			$nva[$i]->flags = TNgHttp2::NV_FLAG_NONE;
+			$keep[] = $nameBuf;
+			$keep[] = $valueBuf;
+		}
+		self::assertGreaterThan(0, $ffi->nghttp2_submit_request2($client, null, $nva, count($pairs), null, null));
+
+		while (true) {
+			$dataPtr = $ffi->new('uint8_t*');
+			$n = $ffi->nghttp2_session_mem_send2($client, \FFI::addr($dataPtr));
+			if ($n <= 0) {
+				break;
+			}
+			$server->receive(\FFI::string($dataPtr, $n));
+		}
+		$ffi->nghttp2_session_del($client);
+		$ffi->nghttp2_session_callbacks_del($cbs);
+
+		self::assertNotNull($headers, 'The server saw the request.');
+		self::assertSame('a=1; b=2', $headers['cookie'], 'cookie crumbs rejoin with "; ".');
+		self::assertSame('one, two', $headers['x-tag'], 'Other repeated fields combine with ", ".');
+		$server->close();
+	}
+
+	public function testHeaderNamesAreLowercasedOnSubmit()
+	{
+		$server = new TH2Session(true);
+		$client = new TH2Session(false);
+		$server->submitSettings([]);
+		$client->submitSettings([]);
+
+		$seen = null;
+		$server->attachEventHandler('onRequest', function ($s, $stream) use ($server, &$seen) {
+			$seen = $stream->getHeaders();
+			$server->respond($stream, [':status' => '200', 'Content-Type' => 'text/plain']);
+			$stream->markLocalClosed();
+		});
+		$response = null;
+		$client->attachEventHandler('onResponse', function ($s, $stream) use (&$response) {
+			$response = $stream->getHeaders();
+		});
+
+		$request = $client->request([':method' => 'GET', ':scheme' => 'http', ':authority' => 'h', ':path' => '/', 'X-Custom' => 'v']);
+		$request->markLocalClosed();
+		self::assertSame('v', $request->getHeader('x-custom'), 'The client stream carries the lowercased name.');
+		self::assertNull($request->getHeader('X-Custom'));
+		for ($i = 0; $i < 4; $i++) {
+			$server->receive($client->send());
+			$client->receive($server->send());
+		}
+
+		self::assertSame('v', $seen['x-custom'] ?? null, 'The server received the lowercased request header.');
+		self::assertSame('text/plain', $response['content-type'] ?? null, 'The client received the lowercased response header.');
+		$server->close();
+		$client->close();
+	}
+
+	public function testPeerResetMakesStreamNonWritable()
+	{
+		$server = new TH2Session(true);
+		$client = new TH2Session(false);
+		$server->submitSettings([]);
+		$client->submitSettings([]);
+
+		$serverStream = null;
+		$server->attachEventHandler('onRequest', function ($s, $stream) use (&$serverStream) {
+			$serverStream = $stream;
+		});
+		$writableInOnClose = null;
+		$server->attachEventHandler('onClose', function ($s, $stream) use (&$writableInOnClose) {
+			$writableInOnClose = $stream->isWritable();
+		});
+
+		$stream = $client->request([':method' => 'POST', ':scheme' => 'http', ':authority' => 'h', ':path' => '/']);
+		$server->receive($client->send());
+		self::assertTrue($serverStream->isWritable(), 'Open before the reset.');
+		$stream->cancel();
+		$server->receive($client->send());
+
+		self::assertFalse($writableInOnClose, 'onClose sees the stream closed in both directions.');
+		self::assertFalse($serverStream->isWritable());
+		try {
+			$serverStream->write('too late');
+			self::fail('A write after the peer reset did not throw.');
+		} catch (\RuntimeException $e) {
+			self::assertStringContainsString('closed', $e->getMessage());
+		}
+		$server->close();
+		$client->close();
+	}
 }

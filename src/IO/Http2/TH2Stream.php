@@ -27,8 +27,9 @@ use Psr\Http\Message\StreamInterface;
  * have arrived yet.  The stream is at {@see eof()} once the peer half-closes and the buffer is
  * drained.  {@see markLocalClosed()} finishes a finite body: the queued bytes flush and the
  * stream then ends (END_STREAM), unlike {@see close()}, which discards the buffers and leaves
- * the stream detached.  A {@see read()}, {@see getContents()}, or {@see write()} on a detached
- * stream throws, per PSR-7.
+ * the stream detached.  Once nghttp2 closes the stream (peer reset, completion, or session
+ * close) the session marks both directions closed: buffered bytes stay readable, a write throws.
+ * A {@see read()}, {@see getContents()}, or {@see write()} on a detached stream throws, per PSR-7.
  *
  * State is self-encapsulated: every field is reached through a protected `get*Direct()`/
  * `set*Direct()` accessor (the byte buffers return by reference), so a subclass can intercept
@@ -343,6 +344,18 @@ class TH2Stream extends TComponent implements StreamInterface
 	public function markRemoteClosed(): void
 	{
 		$this->setRemoteClosedDirect(true);
+	}
+
+	/**
+	 * Marks both directions closed without touching the session: nghttp2 no longer has the stream
+	 * (the peer reset it, it completed, or the session closed).  Buffered incoming bytes stay
+	 * readable until drained; a {@see write()} throws.  Called by {@see TH2Session}.
+	 * @since 1.1.0
+	 */
+	public function markClosed(): void
+	{
+		$this->setRemoteClosedDirect(true);
+		$this->setLocalClosedDirect(true);
 	}
 
 	/**

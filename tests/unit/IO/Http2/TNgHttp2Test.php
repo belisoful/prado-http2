@@ -102,4 +102,15 @@ class TNgHttp2Test extends PHPUnit\Framework\TestCase
 		$ffi->nghttp2_session_del($client);
 		$ffi->nghttp2_session_callbacks_del($cbs);
 	}
+
+
+	public function testVersionInfoLayoutMatchesLibrary()
+	{
+		// nghttp2_info is declared field for field in the cdef; version_num must agree with version_str.
+		$info = TNgHttp2::ffi()->nghttp2_version(0);
+		self::assertSame(1, $info->age);
+		[$major, $minor, $patch] = array_map('intval', explode('.', TNgHttp2::version()));
+		self::assertSame(($major << 16) | ($minor << 8) | $patch, $info->version_num);
+		self::assertSame('h2', \FFI::string($info->proto_str));
+	}
 }

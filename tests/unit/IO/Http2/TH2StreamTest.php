@@ -209,4 +209,21 @@ class TH2StreamTest extends PHPUnit\Framework\TestCase
 		$stream = new TH2Stream($session, 7, []);
 		$stream->cancel();
 	}
+
+
+	public function testMarkClosedClosesBothDirectionsAndKeepsBuffers()
+	{
+		$stream = $this->stream();
+		$stream->pushIncoming('tail');
+		$stream->markClosed();
+		self::assertFalse($stream->isWritable());
+		self::assertTrue($stream->isLocalClosed());
+		self::assertTrue($stream->isReadable(), 'Buffered bytes stay readable.');
+		self::assertFalse($stream->eof(), 'Not at eof until the buffer drains.');
+		self::assertSame('tail', $stream->getContents());
+		self::assertTrue($stream->eof());
+		self::assertFalse($stream->isReadable());
+		$this->expectException(\RuntimeException::class);
+		$stream->write('late');
+	}
 }

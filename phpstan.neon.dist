@@ -1,6 +1,8 @@
 parameters:
-    phpVersion: 80300 # PHP 8.3
-    level: 2
+    phpVersion:
+        min: 80100 # PHP 8.1, the oldest runtime the package supports
+        max: 80500 # PHP 8.5, the newest runtime the package supports
+    level: 3
     bootstrapFiles:
         - tests/test_tools/phpstan-bootstrap.php
     paths:
@@ -11,7 +13,6 @@ parameters:
         - '#Call to an undefined method FFI::[a-zA-Z0-9_]+\(\)#'
         # FFI\CData struct fields (from the cdef) are dynamic and unprovable statically.
         - '#Access to an undefined property FFI\\CData::\$[a-zA-Z0-9_]+#'
-
 services:
     -
         class: Prado\PHPStan\DynamicMethodsClassReflectionExtension

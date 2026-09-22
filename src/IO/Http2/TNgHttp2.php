@@ -110,10 +110,10 @@ final class TNgHttp2
 
 	/** @var string The C declarations bound from libnghttp2. */
 	private const CDEF = <<<'C'
-		typedef long nghttp2_ssize;
+		typedef ptrdiff_t nghttp2_ssize;
 		typedef struct nghttp2_session nghttp2_session;
 		typedef struct nghttp2_session_callbacks nghttp2_session_callbacks;
-		typedef struct { int age; const char *version_str; const char *proto_str; int version_num; } nghttp2_info;
+		typedef struct { int age; int version_num; const char *version_str; const char *proto_str; } nghttp2_info;
 		typedef struct { size_t length; int32_t stream_id; uint8_t type; uint8_t flags; uint8_t reserved; } nghttp2_frame_hd;
 		typedef struct { int32_t settings_id; uint32_t value; } nghttp2_settings_entry;
 		typedef struct { uint8_t *name; uint8_t *value; size_t namelen; size_t valuelen; uint8_t flags; } nghttp2_nv;

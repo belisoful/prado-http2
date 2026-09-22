@@ -30,6 +30,12 @@ use Prado\TComponent;
  * Outgoing bytes written to a {@see TH2Stream} are pulled into DATA frames by a shared data
  * provider; an empty open stream defers until {@see resumeStream()} (triggered by a write).
  *
+ * Header names are lowercased on submit (RFC 9113 §8.2.1).  A received field that repeats keeps
+ * every value: `cookie` rejoins with `; `, any other name combines with `, `.  A client session
+ * accepts server push unless it submits `SETTINGS_ENABLE_PUSH => 0`; a pushed stream has no
+ * {@see TH2Stream}, so its frames are discarded.  {@see close()} frees the nghttp2 session; every
+ * later nghttp2 call throws `http2_session_closed`.
+ *
  * The nghttp2 callbacks are built once and shared by every session: PHP closures handed to FFI
  * are retained for the FFI instance's life, so per-session closures would leak.  The shared
  * callbacks route to the owning session through nghttp2's `user_data`, a per-session id held in
@@ -41,7 +47,8 @@ use Prado\TComponent;
  *  - onRequest: a server request stream's headers are complete.
  *  - onResponse: a client request's final (non-1xx) response headers arrived.
  *  - onInformationalResponse: a client received a 1xx informational response (100, 103, ...).
- *  - onTrailers: a client received a trailing header block (HEADERS after the body, no `:status`).
+ *  - onTrailers: a trailing header block arrived (a second HEADERS on the stream): request trailers
+ *    on the server, response trailers (no `:status`) on the client.
  *  - onData: DATA arrived on a stream (read it via the stream).
  *  - onClose: a stream closed.
  *
@@ -69,7 +76,7 @@ class TH2Session extends TComponent
 	/** @var array<int, mixed> The shared callback closures, kept alive for the process. */
 	private static array $_sharedRefs = [];
 
-	/** @var array<int, TH2Session> Live sessions, keyed by routing id (nghttp2 user_data). */
+	/** @var array<int, \WeakReference<TH2Session>> Live sessions keyed by routing id (nghttp2 user_data), held weakly so an unreferenced session is collected and freed. */
 	private static array $_registry = [];
 
 	/** @var int The next routing id to assign. */
@@ -286,17 +293,19 @@ class TH2Session extends TComponent
 		$callbacks = $ffi->new('nghttp2_session_callbacks*');
 		$ffi->nghttp2_session_callbacks_new(\FFI::addr($callbacks));
 
-		$onBeginHeaders = static function ($session, $frame, $userData) {
-			self::fromUserData($userData)?->handleBeginHeaders($frame->stream_id);
+		// Each closure resolves its session through the FFI instance it was built with, so a later
+		// TNgHttp2::setLibraryPath() re-bind (or a failed one) cannot reach into a callback.
+		$onBeginHeaders = static function ($session, $frame, $userData) use ($ffi) {
+			self::fromUserData($ffi, $userData)?->handleBeginHeaders($frame->stream_id);
 			return 0;
 		};
-		$onHeader = static function ($session, $frame, $name, $namelen, $value, $valuelen, $flags, $userData) {
-			self::fromUserData($userData)?->handleHeader($frame->stream_id, \FFI::string($name, $namelen), \FFI::string($value, $valuelen));
+		$onHeader = static function ($session, $frame, $name, $namelen, $value, $valuelen, $flags, $userData) use ($ffi) {
+			self::fromUserData($ffi, $userData)?->handleHeader($frame->stream_id, \FFI::string($name, $namelen), \FFI::string($value, $valuelen));
 			return 0;
 		};
-		$onFrameRecv = static fn ($session, $frame, $userData) => self::fromUserData($userData)?->handleFrameRecv($frame) ?? 0;
-		$onDataChunk = static fn ($session, $flags, $streamId, $data, $len, $userData) => self::fromUserData($userData)?->handleDataChunk($streamId, \FFI::string($data, $len)) ?? 0;
-		$onStreamClose = static fn ($session, $streamId, $errorCode, $userData) => self::fromUserData($userData)?->handleStreamClose($streamId) ?? 0;
+		$onFrameRecv = static fn ($session, $frame, $userData) => self::fromUserData($ffi, $userData)?->handleFrameRecv($frame) ?? 0;
+		$onDataChunk = static fn ($session, $flags, $streamId, $data, $len, $userData) => self::fromUserData($ffi, $userData)?->handleDataChunk($streamId, \FFI::string($data, $len)) ?? 0;
+		$onStreamClose = static fn ($session, $streamId, $errorCode, $userData) => self::fromUserData($ffi, $userData)?->handleStreamClose($streamId) ?? 0;
 
 		$ffi->nghttp2_session_callbacks_set_on_begin_headers_callback($callbacks, $onBeginHeaders);
 		$ffi->nghttp2_session_callbacks_set_on_header_callback($callbacks, $onHeader);
@@ -305,8 +314,8 @@ class TH2Session extends TComponent
 		$ffi->nghttp2_session_callbacks_set_on_stream_close_callback($callbacks, $onStreamClose);
 
 		$provider = $ffi->new('nghttp2_data_provider2');
-		$provideData = static function ($session, $streamId, $buf, $length, $dataFlags, $source, $userData) {
-			$self = self::fromUserData($userData);
+		$provideData = static function ($session, $streamId, $buf, $length, $dataFlags, $source, $userData) use ($ffi) {
+			$self = self::fromUserData($ffi, $userData);
 			if ($self === null) {
 				$dataFlags[0] = TNgHttp2::DATA_FLAG_EOF;
 				return 0;
@@ -315,22 +324,22 @@ class TH2Session extends TComponent
 		};
 		$provider->read_callback = $provideData;
 
-		$onFrameSend = static function ($session, $frame, $userData) {
-			self::fromUserData($userData)?->onFrameSent(self::frameInfo($frame));
+		$onFrameSend = static function ($session, $frame, $userData) use ($ffi) {
+			self::fromUserData($ffi, $userData)?->onFrameSent(self::frameInfo($frame));
 			return 0;
 		};
-		$onFrameNotSend = static function ($session, $frame, $libError, $userData) {
-			self::fromUserData($userData)?->onFrameNotSent(self::frameInfo($frame) + ['error' => $libError]);
+		$onFrameNotSend = static function ($session, $frame, $libError, $userData) use ($ffi) {
+			self::fromUserData($ffi, $userData)?->onFrameNotSent(self::frameInfo($frame) + ['error' => $libError]);
 			return 0;
 		};
-		$onInvalidFrame = static function ($session, $frame, $libError, $userData) {
-			self::fromUserData($userData)?->onInvalidFrame(self::frameInfo($frame) + ['error' => $libError]);
+		$onInvalidFrame = static function ($session, $frame, $libError, $userData) use ($ffi) {
+			self::fromUserData($ffi, $userData)?->onInvalidFrame(self::frameInfo($frame) + ['error' => $libError]);
 			return 0;
 		};
-		$onError = static function ($session, $libError, $msg, $len, $userData) {
+		$onError = static function ($session, $libError, $msg, $len, $userData) use ($ffi) {
 			// FFI converts the const char* `msg` to a PHP string; some builds yield CData instead.
 			$message = is_string($msg) ? $msg : \FFI::string($msg, $len);
-			self::fromUserData($userData)?->onSessionError($message);
+			self::fromUserData($ffi, $userData)?->onSessionError($message);
 			return 0;
 		};
 		$ffi->nghttp2_session_callbacks_set_on_frame_send_callback($callbacks, $onFrameSend);
@@ -347,17 +356,19 @@ class TH2Session extends TComponent
 	}
 
 	/**
-	 * Resolves the session from a callback's nghttp2 `user_data` (an int64 routing id).
+	 * Resolves the session from a callback's nghttp2 `user_data` (an int64 routing id).  The
+	 * registry holds sessions weakly, so a collected session resolves to null.
+	 * @param \FFI $ffi The FFI instance the callbacks were built with.
 	 * @param ?\FFI\CData $userData The user_data pointer passed by nghttp2.
 	 * @return ?TH2Session The owning session, or null.
 	 */
-	private static function fromUserData(?\FFI\CData $userData): ?TH2Session
+	private static function fromUserData(\FFI $ffi, ?\FFI\CData $userData): ?TH2Session
 	{
 		if ($userData === null) {
 			return null;
 		}
-		$id = TNgHttp2::ffi()->cast('int64_t*', $userData)[0];
-		return self::$_registry[$id] ?? null;
+		$id = $ffi->cast('int64_t*', $userData)[0];
+		return (self::$_registry[$id] ?? null)?->get();
 	}
 
 	/**
@@ -385,7 +396,7 @@ class TH2Session extends TComponent
 		$this->setRefsDirect(self::$_sharedRefs);
 
 		$this->setIdDirect(self::$_nextId++);
-		self::$_registry[$this->getIdDirect()] = $this;
+		self::$_registry[$this->getIdDirect()] = \WeakReference::create($this);
 		$userData = $ffi->new('int64_t');
 		$userData->cdata = $this->getIdDirect();
 		$this->setUserDataDirect($userData);
@@ -442,6 +453,7 @@ class TH2Session extends TComponent
 	 */
 	public function submitSettings(array $settings): void
 	{
+		$this->assertOpen();
 		$ffi = $this->getFfiDirect();
 		$count = count($settings);
 		$entries = $count > 0 ? $ffi->new("nghttp2_settings_entry[$count]") : null;
@@ -460,20 +472,24 @@ class TH2Session extends TComponent
 	/**
 	 * Returns a setting value the peer advertised (e.g. {@see TNgHttp2::SETTINGS_ENABLE_CONNECT_PROTOCOL}).
 	 * @param int $id A {@see TNgHttp2} `SETTINGS_*` id.
+	 * @throws THttp2Exception When the session is closed.
 	 * @return int The negotiated value.
 	 */
 	public function getRemoteSetting(int $id): int
 	{
+		$this->assertOpen();
 		return $this->getFfiDirect()->nghttp2_session_get_remote_settings($this->getSessionDirect(), $id);
 	}
 
 	/**
 	 * Returns a setting value this side advertised.
 	 * @param int $id A {@see TNgHttp2} `SETTINGS_*` id.
+	 * @throws THttp2Exception When the session is closed.
 	 * @return int The local value.
 	 */
 	public function getLocalSetting(int $id): int
 	{
+		$this->assertOpen();
 		return $this->getFfiDirect()->nghttp2_session_get_local_settings($this->getSessionDirect(), $id);
 	}
 
@@ -489,6 +505,8 @@ class TH2Session extends TComponent
 	 */
 	public function request(array $headers): TH2Stream
 	{
+		$this->assertOpen();
+		$headers = array_change_key_case($headers, CASE_LOWER);
 		$keep = [];
 		$nva = $this->buildHeaders($headers, $keep);
 		$streamId = $this->getFfiDirect()->nghttp2_submit_request2($this->getSessionDirect(), null, $nva, count($headers), \FFI::addr($this->getDataProviderDirect()), null);
@@ -509,6 +527,7 @@ class TH2Session extends TComponent
 	 */
 	public function respond(TH2Stream $stream, array $headers): void
 	{
+		$this->assertOpen();
 		$keep = [];
 		$nva = $this->buildHeaders($headers, $keep);
 		$result = $this->getFfiDirect()->nghttp2_submit_response2($this->getSessionDirect(), $stream->getStreamId(), $nva, count($headers), \FFI::addr($this->getDataProviderDirect()));
@@ -527,6 +546,7 @@ class TH2Session extends TComponent
 	 */
 	public function submitTrailers(int $streamId, array $headers): void
 	{
+		$this->assertOpen();
 		$keep = [];
 		$nva = $this->buildHeaders($headers, $keep);
 		$result = $this->getFfiDirect()->nghttp2_submit_trailer($this->getSessionDirect(), $streamId, $nva, count($headers));
@@ -553,6 +573,7 @@ class TH2Session extends TComponent
 	 */
 	public function resetStream(int $streamId, int $errorCode = TNgHttp2::CANCEL): void
 	{
+		$this->assertOpen();
 		$result = $this->getFfiDirect()->nghttp2_submit_rst_stream($this->getSessionDirect(), 0, $streamId, $errorCode);
 		if ($result !== 0) {
 			throw new THttp2Exception('http2_session_failed', TNgHttp2::strerror($result));
@@ -563,11 +584,14 @@ class TH2Session extends TComponent
 	 * Resumes a deferred stream so nghttp2 pulls its newly queued outgoing DATA.  The return code is
 	 * intentionally ignored: nghttp2 returns `NGHTTP2_ERR_INVALID_ARGUMENT` when the stream is not
 	 * currently deferred, which is the normal case for a write to an already-active stream, not a
-	 * failure.  Resuming is best-effort and idempotent.
+	 * failure.  Resuming is best-effort and idempotent, and a no-op on a closed session.
 	 * @param int $streamId The stream identifier.
 	 */
 	public function resumeStream(int $streamId): void
 	{
+		if ($this->getClosedDirect()) {
+			return;
+		}
 		$this->getFfiDirect()->nghttp2_session_resume_data($this->getSessionDirect(), $streamId);
 	}
 
@@ -582,6 +606,7 @@ class TH2Session extends TComponent
 	 */
 	public function receive(string $bytes): void
 	{
+		$this->assertOpen();
 		$length = strlen($bytes);
 		if ($length === 0) {
 			return;
@@ -603,6 +628,7 @@ class TH2Session extends TComponent
 	 */
 	public function send(): string
 	{
+		$this->assertOpen();
 		$ffi = $this->getFfiDirect();
 		$output = '';
 		while (true) {
@@ -621,11 +647,14 @@ class TH2Session extends TComponent
 
 	/**
 	 * Indicates whether the session still wants to read from or write to the transport.  An event
-	 * loop ends and closes the connection once this is false.
+	 * loop ends and closes the connection once this is false.  A closed session wants none.
 	 * @return bool Whether the session has pending I/O.
 	 */
 	public function wantsIo(): bool
 	{
+		if ($this->getClosedDirect()) {
+			return false;
+		}
 		$ffi = $this->getFfiDirect();
 		return $ffi->nghttp2_session_want_read($this->getSessionDirect()) !== 0
 			|| $ffi->nghttp2_session_want_write($this->getSessionDirect()) !== 0;
@@ -642,6 +671,7 @@ class TH2Session extends TComponent
 	 */
 	public function goaway(int $errorCode = TNgHttp2::NO_ERROR): void
 	{
+		$this->assertOpen();
 		$result = $this->getFfiDirect()->nghttp2_session_terminate_session($this->getSessionDirect(), $errorCode);
 		if ($result !== 0) {
 			throw new THttp2Exception('http2_session_failed', TNgHttp2::strerror($result));
@@ -655,6 +685,7 @@ class TH2Session extends TComponent
 	 */
 	public function ping(string $payload = ''): void
 	{
+		$this->assertOpen();
 		$ffi = $this->getFfiDirect();
 		$opaque = null;
 		if ($payload !== '') {
@@ -670,10 +701,12 @@ class TH2Session extends TComponent
 
 	/**
 	 * Indicates whether a client may open a new {@see request()} (not GOAWAY-ed, under the limit).
+	 * @throws THttp2Exception When the session is closed.
 	 * @return bool Whether a new request is allowed.
 	 */
 	public function isRequestAllowed(): bool
 	{
+		$this->assertOpen();
 		return $this->getFfiDirect()->nghttp2_session_check_request_allowed($this->getSessionDirect()) !== 0;
 	}
 
@@ -685,6 +718,7 @@ class TH2Session extends TComponent
 	 */
 	public function submitWindowUpdate(int $streamId, int $increment): void
 	{
+		$this->assertOpen();
 		$result = $this->getFfiDirect()->nghttp2_submit_window_update($this->getSessionDirect(), 0, $streamId, $increment);
 		if ($result !== 0) {
 			throw new THttp2Exception('http2_session_failed', TNgHttp2::strerror($result));
@@ -700,6 +734,7 @@ class TH2Session extends TComponent
 	 */
 	public function consume(int $streamId, int $size): void
 	{
+		$this->assertOpen();
 		$result = $this->getFfiDirect()->nghttp2_session_consume($this->getSessionDirect(), $streamId, $size);
 		if ($result !== 0) {
 			throw new THttp2Exception('http2_session_failed', TNgHttp2::strerror($result));
@@ -711,8 +746,11 @@ class TH2Session extends TComponent
 	// =========================================================================
 
 	/**
-	 * Closes the session, freeing the nghttp2 session and unregistering it.  The shared callbacks
-	 * and data provider are process-wide and are not freed here.
+	 * Closes the session, freeing the nghttp2 session and unregistering it.  Streams still open are
+	 * marked closed in both directions ({@see TH2Stream::markClosed()}): their buffered bytes stay
+	 * readable and a write throws.  Every later nghttp2 call on the session throws
+	 * `http2_session_closed`.  The shared callbacks and data provider are process-wide and are not
+	 * freed here.
 	 */
 	public function close(): void
 	{
@@ -722,6 +760,9 @@ class TH2Session extends TComponent
 		$this->setClosedDirect(true);
 		$this->getFfiDirect()->nghttp2_session_del($this->getSessionDirect());
 		unset(self::$_registry[$this->getIdDirect()]);
+		foreach ($this->getStreamsDirect() as $stream) {
+			$stream->markClosed();
+		}
 		$this->setStreamsDirect([]);
 		$this->setUserDataDirect(null);
 		$this->setDataProviderDirect(null);
@@ -742,6 +783,18 @@ class TH2Session extends TComponent
 		parent::__destruct();
 	}
 
+	/**
+	 * Throws when the session is closed.  {@see close()} frees the nghttp2 session, so a later
+	 * nghttp2 call would touch freed memory.
+	 * @throws THttp2Exception When the session is closed.
+	 */
+	private function assertOpen(): void
+	{
+		if ($this->getClosedDirect()) {
+			throw new THttp2Exception('http2_session_closed');
+		}
+	}
+
 	// =========================================================================
 	// nghttp2 Callbacks
 	// =========================================================================
@@ -757,7 +810,9 @@ class TH2Session extends TComponent
 	}
 
 	/**
-	 * Records one received header for a stream.
+	 * Records one received header for a stream.  A repeated name keeps every value: `cookie`
+	 * crumbs rejoin with `; ` (RFC 9113 §8.2.3) and any other field combines with `, `
+	 * (RFC 9110 §5.3).
 	 * @param int $streamId The stream identifier.
 	 * @param string $name The header name.
 	 * @param string $value The header value.
@@ -765,11 +820,16 @@ class TH2Session extends TComponent
 	private function handleHeader(int $streamId, string $name, string $value): void
 	{
 		$pending = &$this->getPendingHeadersDirect();
-		$pending[$streamId][$name] = $value;
+		if (isset($pending[$streamId][$name])) {
+			$pending[$streamId][$name] .= ($name === 'cookie' ? '; ' : ', ') . $value;
+		} else {
+			$pending[$streamId][$name] = $value;
+		}
 	}
 
 	/**
-	 * Handles a completed frame: opens/finishes streams on HEADERS and tracks END_STREAM.
+	 * Handles a completed frame: opens streams on a first HEADERS, routes a later HEADERS as
+	 * trailers (or, on the client, as an informational or final response), and tracks END_STREAM.
 	 * @param \FFI\CData $frame The nghttp2_frame_hd of the received frame.
 	 * @return int Always 0 (continue).
 	 */
@@ -783,12 +843,22 @@ class TH2Session extends TComponent
 			unset($pending[$streamId]);
 			$streams = &$this->getStreamsDirect();
 			if ($this->getIsServerDirect()) {
-				$stream = $streams[$streamId] ?? Prado::createComponent(TH2Stream::class, $this, $streamId, $headers);
-				$streams[$streamId] = $stream;
-				if ($endStream) {
-					$stream->markRemoteClosed();
+				$stream = $streams[$streamId] ?? null;
+				if ($stream === null) {
+					$stream = Prado::createComponent(TH2Stream::class, $this, $streamId, $headers);
+					$streams[$streamId] = $stream;
+					if ($endStream) {
+						$stream->markRemoteClosed();
+					}
+					$this->onRequest($stream);
+				} else {
+					// A second HEADERS on a request stream is the client's trailing header block.
+					$stream->mergeHeaders($headers);
+					if ($endStream) {
+						$stream->markRemoteClosed();
+					}
+					$this->onTrailers($stream);
 				}
-				$this->onRequest($stream);
 			} else {
 				$stream = $streams[$streamId] ?? null;
 				if ($stream !== null) {
@@ -830,7 +900,7 @@ class TH2Session extends TComponent
 	}
 
 	/**
-	 * Handles a closed stream: marks it, raises {@see onClose}, and forgets it.
+	 * Handles a closed stream: marks both directions closed, raises {@see onClose}, and forgets it.
 	 * @param int $streamId The stream identifier.
 	 * @return int Always 0 (continue).
 	 */
@@ -839,7 +909,7 @@ class TH2Session extends TComponent
 		$streams = &$this->getStreamsDirect();
 		$stream = $streams[$streamId] ?? null;
 		if ($stream !== null) {
-			$stream->markRemoteClosed();
+			$stream->markClosed();
 			$this->onClose($stream);
 			unset($streams[$streamId]);
 		}
@@ -883,6 +953,8 @@ class TH2Session extends TComponent
 
 	/**
 	 * Builds an nghttp2_nv[] from header pairs; $keep holds the byte buffers alive during submit.
+	 * Names are lowercased: HTTP/2 field names are lowercase (RFC 9113 §8.2.1) and nghttp2 rejects
+	 * an uppercase name.
 	 * @param array<string, string> $headers The header name => value pairs.
 	 * @param array<int, mixed> &$keep Receives the name/value buffers (held by the caller).
 	 * @return \FFI\CData The nghttp2_nv array.
@@ -894,6 +966,8 @@ class TH2Session extends TComponent
 		$nva = $ffi->new("nghttp2_nv[$count]");
 		$i = 0;
 		foreach ($headers as $name => $value) {
+			$name = strtolower((string) $name);
+			$value = (string) $value;
 			$nameLen = strlen($name);
 			$valueLen = strlen($value);
 			// Owned (auto-freed): held in $keep through the submit call, which copies the headers.
@@ -952,8 +1026,9 @@ class TH2Session extends TComponent
 	}
 
 	/**
-	 * Raised when a client receives a trailing header block (a HEADERS frame after the response
-	 * body, carrying no `:status`).  The trailers are merged into the stream's headers.
+	 * Raised when a trailing header block arrives: a second HEADERS frame on the stream, after the
+	 * body.  A server receives request trailers; a client receives response trailers (no `:status`).
+	 * The trailers are merged into the stream's headers.
 	 * @param TH2Stream $stream The stream carrying the trailers.
 	 */
 	public function onTrailers(TH2Stream $stream): void

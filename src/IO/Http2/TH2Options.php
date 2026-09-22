@@ -38,28 +38,60 @@ class TH2Options extends TComponent
 	/** @var bool Whether automatic flow-control window updates are disabled. */
 	private bool $_noAutoWindowUpdate = false;
 
+	// =========================================================================
+	// Self-Encapsulated Accessors
+	// =========================================================================
+
+	/** @return ?int The raw peer concurrency limit, or null. */
+	protected function getPeerMaxConcurrentStreamsDirect(): ?int
+	{
+		return $this->_peerMaxConcurrentStreams;
+	}
+
+	/** @param ?int $value The raw peer concurrency limit, or null. */
+	protected function setPeerMaxConcurrentStreamsDirect(?int $value): void
+	{
+		$this->_peerMaxConcurrentStreams = $value;
+	}
+
+	/** @return bool The raw no-auto-window-update flag. */
+	protected function getNoAutoWindowUpdateDirect(): bool
+	{
+		return $this->_noAutoWindowUpdate;
+	}
+
+	/** @param bool $value The raw no-auto-window-update flag. */
+	protected function setNoAutoWindowUpdateDirect(bool $value): void
+	{
+		$this->_noAutoWindowUpdate = $value;
+	}
+
+	// =========================================================================
+	// Properties
+	// =========================================================================
+
 	/** @return ?int The assumed peer concurrency limit, or null for nghttp2's default. */
 	public function getPeerMaxConcurrentStreams(): ?int
 	{
-		return $this->_peerMaxConcurrentStreams;
+		return $this->getPeerMaxConcurrentStreamsDirect();
 	}
 
 	/** @param ?int $value The assumed peer concurrency limit, or null for nghttp2's default. */
 	public function setPeerMaxConcurrentStreams(?int $value): void
 	{
-		$this->_peerMaxConcurrentStreams = $value;
+		$this->setPeerMaxConcurrentStreamsDirect($value);
 	}
 
 	/** @return bool Whether automatic flow-control window updates are disabled. */
 	public function getNoAutoWindowUpdate(): bool
 	{
-		return $this->_noAutoWindowUpdate;
+		return $this->getNoAutoWindowUpdateDirect();
 	}
 
 	/** @param bool $value Whether to disable automatic flow-control window updates. */
 	public function setNoAutoWindowUpdate(bool $value): void
 	{
-		$this->_noAutoWindowUpdate = $value;
+		$this->setNoAutoWindowUpdateDirect($value);
 	}
 
 	/**
@@ -68,7 +100,7 @@ class TH2Options extends TComponent
 	 */
 	public function isEmpty(): bool
 	{
-		return $this->_peerMaxConcurrentStreams === null
-			&& !$this->_noAutoWindowUpdate;
+		return $this->getPeerMaxConcurrentStreamsDirect() === null
+			&& !$this->getNoAutoWindowUpdateDirect();
 	}
 }

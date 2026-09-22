@@ -46,7 +46,7 @@
 		"pradosoft/prado" : "^4.4",
 		"phpunit/phpunit" : "^10",
 		"phpdocumentor/shim": "^3",
-		"friendsofphp/php-cs-fixer": "^3.94",
+		"friendsofphp/php-cs-fixer": "^3.95",
 		"phpstan/phpstan": "^2.1"
 	},
 	"config": {

@@ -6,17 +6,17 @@ A complete, correct HTTP/2 stack is large — frame layer, HPACK header compress
 
 The session I/O is **memory based**: you feed received bytes in and drain produced bytes out, so the same code drives a real socket or an in-process test that pumps bytes between two sessions. This makes HTTP/2 testable without sockets or TLS (cleartext `h2c`).
 
-It is the foundation for HTTP/2 servers and clients, and for [RFC 8441](https://www.rfc-editor.org/rfc/rfc8441.html) WebSocket-over-HTTP/2 multiplexing (used by the [`prado-websockets`](https://github.com/pradosoft/prado-websockets) extension).
+It is the foundation for HTTP/2 servers and clients, and for [RFC 8441](https://www.rfc-editor.org/rfc/rfc8441.html) WebSocket-over-HTTP/2 multiplexing (used by the [`prado-websocket`](https://github.com/belisoful/prado-websocket) extension).
 
 ## Requirements
 
 | Requirement | Scope | Purpose |
 |---|---|---|
-| PHP 8.1 or higher | required | — |
+| PHP 8.1 to 8.5 | required | CI runs 8.1, 8.2, 8.3, 8.4, and 8.5 |
 | `ext-ffi` | required | Binds `libnghttp2` at runtime |
 | System `libnghttp2` | suggested | The HTTP/2 framing engine, loaded at runtime (`brew install libnghttp2`, `apt-get install libnghttp2-dev`) |
 | `ext-openssl` | suggested | HTTP/2 over TLS with ALPN `h2`; cleartext `h2c` needs nothing extra |
-| PRADO Framework `^4.4` | dev | `TComponent`, `TModule`, `TException`, the IO layer |
+| PRADO Framework `^4.4` (master) | dev | `TComponent`, `TException`/`TIOException`, the PHPStan extensions |
 
 > **FFI note.** `ffi.enable` must permit FFI (CLI always allows it; for other SAPIs use `preload` or `true`). HTTP/2 here is intended for a long-running PHP process (a socket server or client), not a per-request web SAPI.
 
@@ -125,7 +125,9 @@ $session->receive($transport->read(65536));
 
 `TH2Stream` is a full PSR-7 `StreamInterface` (`write()` queues outgoing DATA and resumes the stream; `read()`/`getContents()` return buffered incoming DATA; it is **not** seekable). Per PSR-7 it throws when written to after it is local-closed/closed, or read after it is closed/detached. This supports request/response bodies and long-lived tunnels alike. An RFC 8441 Extended CONNECT (`:method` `CONNECT`, `:protocol` `websocket`) opens a bidirectional stream that carries arbitrary bytes both ways — the basis for WebSocket-over-HTTP/2.
 
-A finite body is finished two ways: `markLocalClosed()` flushes the queued bytes and ends the stream (END_STREAM), and `sendTrailers([...])` flushes the body and then ends the stream with a trailing header block (HTTP/2 trailers, e.g. `grpc-status`). `close()` instead discards the buffers and detaches the stream.
+A finite body is finished two ways: `markLocalClosed()` flushes the queued bytes and ends the stream (END_STREAM), and `sendTrailers([...])` flushes the body and then ends the stream with a trailing header block (HTTP/2 trailers, e.g. `grpc-status`). `close()` instead discards the buffers and detaches the stream. Once nghttp2 closes a stream (peer reset, completion, or session close) both directions are marked closed: buffered bytes stay readable and a write throws.
+
+Trailers flow both ways: `onTrailers` fires on the server for request trailers and on the client for response trailers. Header names are lowercased on submit (RFC 9113 §8.2.1). A received field that repeats keeps every value: `cookie` crumbs rejoin with `; ` and any other name combines with `, `.
 
 ### Connection control and tuning
 
@@ -138,6 +140,9 @@ A finite body is finished two ways: `markLocalClosed()` flushes the queued bytes
 - `wantsIo()` — whether the session still has I/O pending, so an event loop knows when to stop.
 - `isRequestAllowed()` — client-side: whether a new `request()` is permitted (not GOAWAY-ed, under the limit).
 - `submitWindowUpdate()` / `consume()` — manual flow control, paired with `TH2Options::setNoAutoWindowUpdate()`.
+- `close()` — frees the nghttp2 session and marks its open streams closed; any later nghttp2 call on the session throws `http2_session_closed`. Sessions are held weakly, so an unreferenced session is collected and freed on its own.
+
+A client session accepts server push unless it submits `TNgHttp2::SETTINGS_ENABLE_PUSH => 0`; a pushed stream has no `TH2Stream`, so its frames are discarded.
 
 Tuning is passed at creation: `new TH2Session(true, (new TH2Options())->setPeerMaxConcurrentStreams(100))`. Diagnostic events `onFrameSent`/`onFrameNotSent`/`onInvalidFrame`/`onSessionError` surface frame activity and protocol errors.
 
@@ -193,12 +198,13 @@ A client mirrors this with `stream_socket_client('tls://...')` and `TH2Alpn::neg
 
 ```sh
 composer install
-vendor/bin/phpunit --testsuite unit                  # unit tests (dual in-process sessions)
-vendor/bin/php-cs-fixer fix --dry-run src/           # code style
-vendor/bin/phpstan analyse src/ --memory-limit=512M  # static analysis
+composer unittest                                # unit tests (dual in-process sessions)
+composer functest                                # curl --http2-prior-knowledge interop + TLS ALPN
+vendor/bin/php-cs-fixer fix --dry-run            # code style (src/ and tests/)
+vendor/bin/phpstan analyse --memory-limit=512M   # static analysis, level 3, PHP 8.1 to 8.5
 ```
 
-Tests drive a server and a client `TH2Session` against each other in-process (no sockets, no TLS), so they run anywhere `libnghttp2` is installed and skip cleanly where it is not.
+Unit tests drive a server and a client `TH2Session` against each other in-process (no sockets, no TLS), so they run anywhere `libnghttp2` is installed and skip cleanly where it is not. The functional tests serve a request to the system `curl` over a real socket and complete a TLS handshake that negotiates `h2`. CI runs the whole check on PHP 8.1 through 8.5 against the PRADO `master` branch, on every push and once a week.
 
 ## License
 

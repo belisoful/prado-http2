@@ -10,7 +10,8 @@ on:
 jobs:
   composerext:
     name: Tests (PHP ${{ matrix.php-versions }})
-    runs-on: ubuntu-latest
+    # Ubuntu 24.04 ships libnghttp2 1.59.0, older than the 1.60.0 this binding needs; 26.04 ships 1.68.0.
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
 
     strategy:
@@ -65,6 +66,11 @@ jobs:
 
       - name: Install Composer dependencies
         run: composer install --no-progress --prefer-dist --optimize-autoloader
+
+      - name: Verify libnghttp2 and an HTTP/2 curl are usable (the tests skip silently without them)
+        run: |
+          php -r 'require "vendor/autoload.php"; echo "libnghttp2 ", Prado\IO\Http2\TNgHttp2::version(), PHP_EOL;'
+          curl --version | grep -q HTTP2
 
       - name: Validate code using phpstan
         run: phpstan analyse --error-format=checkstyle | cs2pr

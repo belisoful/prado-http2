@@ -14,7 +14,7 @@ It is the foundation for HTTP/2 servers and clients, and for [RFC 8441](https://
 |---|---|---|
 | PHP 8.2 to 8.5 | required | CI runs 8.2, 8.3, 8.4, and 8.5 |
 | `ext-ffi` | required | Binds `libnghttp2` at runtime |
-| System `libnghttp2` | suggested | The HTTP/2 framing engine, loaded at runtime (`brew install libnghttp2`, `apt-get install libnghttp2-dev`) |
+| System `libnghttp2` 1.60.0 or newer | suggested | The HTTP/2 framing engine, loaded at runtime (`brew install libnghttp2`, `apt-get install libnghttp2-dev`); 1.60.0 introduced the `nghttp2_ssize` API this binding declares. Ubuntu 24.04 ships 1.59.0, Ubuntu 26.04 ships 1.68.0 |
 | `ext-openssl` | suggested | HTTP/2 over TLS with ALPN `h2`; cleartext `h2c` needs nothing extra |
 | PRADO Framework `^4.4` (master) | dev | `TComponent`, `TException`/`TIOException`, the PHPStan extensions |
 
@@ -26,7 +26,7 @@ It is the foundation for HTTP/2 servers and clients, and for [RFC 8441](https://
 composer require belisoful/prado-http2
 ```
 
-The library is resolved in this order: an explicit path set with `TNgHttp2::setLibraryPath()`, the `PRADO_NGHTTP2_LIB` environment variable, then platform defaults (Homebrew/`/usr/local` on macOS, the common `libnghttp2.so.14` sonames on Linux, `nghttp2.dll` on Windows). `TNgHttp2::isAvailable()` reports whether it loads, so an application can fall back to HTTP/1.1 when HTTP/2 is unavailable.
+The library is resolved in this order: an explicit path set with `TNgHttp2::setLibraryPath()`, the `PRADO_NGHTTP2_LIB` environment variable, then platform defaults (Homebrew/`/usr/local` on macOS, the common `libnghttp2.so.14` sonames on Linux, `nghttp2.dll` on Windows). `TNgHttp2::isAvailable()` reports whether it loads, so an application can fall back to HTTP/1.1 when HTTP/2 is unavailable; `TNgHttp2::ffi()` throws `http2_library_too_old` (naming the version found and `TNgHttp2::MIN_VERSION`) when the only library found predates 1.60.0.
 
 ## What it provides
 
@@ -125,7 +125,7 @@ $session->receive($transport->read(65536));
 
 `TH2Stream` is a full PSR-7 `StreamInterface` (`write()` queues outgoing DATA and resumes the stream; `read()`/`getContents()` return buffered incoming DATA; it is **not** seekable). Per PSR-7 it throws when written to after it is local-closed/closed, or read after it is closed/detached. This supports request/response bodies and long-lived tunnels alike. An RFC 8441 Extended CONNECT (`:method` `CONNECT`, `:protocol` `websocket`) opens a bidirectional stream that carries arbitrary bytes both ways — the basis for WebSocket-over-HTTP/2.
 
-A finite body is finished two ways: `markLocalClosed()` flushes the queued bytes and ends the stream (END_STREAM), and `sendTrailers([...])` flushes the body and then ends the stream with a trailing header block (HTTP/2 trailers, e.g. `grpc-status`). `close()` instead discards the buffers and detaches the stream. Once nghttp2 closes a stream (peer reset, completion, or session close) both directions are marked closed: buffered bytes stay readable and a write throws.
+A finite body is finished two ways: `markLocalClosed()` flushes the queued bytes and ends the stream (END_STREAM), and `sendTrailers([...])` flushes the body and then ends the stream with a trailing header block (HTTP/2 trailers, e.g. `grpc-status`). `close()` discards the buffers, detaches the stream, and ends it on the wire: a peer still sending is cancelled (RST_STREAM CANCEL), a peer that has finished sees END_STREAM. Once nghttp2 closes a stream (peer reset, completion, or session close) both directions are marked closed: buffered bytes stay readable and a write throws.
 
 Trailers flow both ways: `onTrailers` fires on the server for request trailers and on the client for response trailers. Header names are lowercased on submit (RFC 9113 §8.2.1). A received field that repeats keeps every value: `cookie` crumbs rejoin with `; ` and any other name combines with `, `.
 
@@ -142,7 +142,9 @@ Trailers flow both ways: `onTrailers` fires on the server for request trailers a
 - `submitWindowUpdate()` / `consume()` — manual flow control, paired with `TH2Options::setNoAutoWindowUpdate()`.
 - `close()` — frees the nghttp2 session and marks its open streams closed; any later nghttp2 call on the session throws `http2_session_closed`. Sessions are held weakly, so an unreferenced session is collected and freed on its own.
 
-A client session accepts server push unless it submits `TNgHttp2::SETTINGS_ENABLE_PUSH => 0`; a pushed stream has no `TH2Stream`, so its frames are discarded.
+A client session declines server push: `submitSettings()` adds `TNgHttp2::SETTINGS_ENABLE_PUSH => 0` unless the caller gives that id. A pushed stream has no `TH2Stream`, so its frames are discarded even when push is enabled.
+
+Event handlers run inside nghttp2 callbacks, where PHP cannot throw. A Throwable raised by a handler is held until nghttp2 finishes the `receive()` or `send()` call that triggered it, then rethrown from that call; every frame in that call was still processed and the session stays usable (bytes a throwing `send()` produced come out of the next `send()`). A failure inside the data provider resets only its stream. Header names are lowercased and pseudo-headers ordered first on submit; a name given twice in different letter case throws `http2_header_duplicate`. Calling `close()` on the session from inside a handler is safe: the PHP side closes at once and nghttp2 is freed when the call returns.
 
 Tuning is passed at creation: `new TH2Session(true, (new TH2Options())->setPeerMaxConcurrentStreams(100))`. Diagnostic events `onFrameSent`/`onFrameNotSent`/`onInvalidFrame`/`onSessionError` surface frame activity and protocol errors.
 
@@ -204,7 +206,7 @@ vendor/bin/php-cs-fixer fix --dry-run            # code style (src/ and tests/)
 vendor/bin/phpstan analyse --memory-limit=512M   # static analysis, level 4, PHP 8.2 to 8.5
 ```
 
-Unit tests drive a server and a client `TH2Session` against each other in-process (no sockets, no TLS), so they run anywhere `libnghttp2` is installed and skip cleanly where it is not. The functional tests serve a request to the system `curl` over a real socket and complete a TLS handshake that negotiates `h2`. CI runs the whole check on PHP 8.2 through 8.5 against the PRADO `master` branch, on every push and once a week.
+Unit tests drive a server and a client `TH2Session` against each other in-process (no sockets, no TLS), so they run anywhere `libnghttp2` is installed and skip cleanly where it is not. The functional tests serve a request to the system `curl` over a real socket and complete a TLS handshake that negotiates `h2`. CI runs the whole check on PHP 8.2 through 8.5 against the PRADO `master` branch, on every push and once a week, on Ubuntu 26.04 (its libnghttp2 is new enough); a step fails the run when the library or an HTTP/2 `curl` is missing, so the skips cannot pass silently.
 
 ## License
 

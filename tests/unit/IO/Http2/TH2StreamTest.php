@@ -226,4 +226,147 @@ class TH2StreamTest extends PHPUnit\Framework\TestCase
 		$this->expectException(\RuntimeException::class);
 		$stream->write('late');
 	}
+
+	public function testPushIncomingAfterCloseIsDropped()
+	{
+		$stream = $this->spyStream();
+		$stream->close();
+		$stream->pushIncoming(str_repeat('z', 1000));
+		self::assertSame('', $stream->rawIncoming(), 'A detached stream buffers nothing: no reader can drain it.');
+	}
+
+	public function testDrainOutgoingInChunksKeepsOrderAndCompacts()
+	{
+		// Draining used to rebuild the remaining buffer per 16 KiB frame (quadratic in the body size).
+		$stream = $this->spyStream();
+		$body = $this->pattern(3 << 20);
+		$stream->write($body);
+		$drained = '';
+		$shrank = false;
+		while ($stream->hasOutgoing()) {
+			$drained .= $stream->drainOutgoing(16384);
+			$shrank = $shrank || strlen($stream->rawOutgoing()) < strlen($body);
+		}
+		self::assertTrue($drained === $body, 'Every byte came out once, in order.');
+		self::assertTrue($shrank, 'The buffer was compacted while partly consumed.');
+		self::assertSame('', $stream->rawOutgoing(), 'A fully drained buffer is released.');
+		self::assertSame('', $stream->drainOutgoing(16384));
+		$stream->write('more');
+		self::assertSame('more', $stream->drainOutgoing(100), 'Writes after a drain start from a clean buffer.');
+	}
+
+	public function testReadInChunksKeepsOrderAndTell()
+	{
+		$stream = $this->spyStream();
+		$body = $this->pattern(3 << 20);
+		$stream->pushIncoming($body);
+		$read = '';
+		while (!$stream->eof() && ($chunk = $stream->read(4096)) !== '') {
+			$read .= $chunk;
+		}
+		self::assertTrue($read === $body, 'Every byte was read once, in order.');
+		self::assertSame(strlen($body), $stream->tell());
+		self::assertSame('', $stream->rawIncoming());
+		$stream->pushIncoming('tail');
+		self::assertSame('ta', $stream->read(2));
+		self::assertSame('il', $stream->getContents(), 'getContents() returns only the unread remainder.');
+		self::assertSame(strlen($body) + 4, $stream->tell());
+	}
+
+	public function testSendTrailersAfterTheBodyEndedThrows()
+	{
+		$stream = $this->stream();
+		$stream->markLocalClosed();
+		$this->expectException(\RuntimeException::class);
+		$stream->sendTrailers(['x-checksum' => 'abc']);
+	}
+
+	public function testSendTrailersAfterCloseThrows()
+	{
+		$stream = $this->stream();
+		$stream->close();
+		$this->expectException(\RuntimeException::class);
+		$stream->sendTrailers(['x-checksum' => 'abc']);
+	}
+
+	public function testMergeHeadersKeepsDigitOnlyNames()
+	{
+		$stream = $this->stream(['123' => 'a', 'x' => 'y']);
+		$stream->mergeHeaders(['z' => '1', 'x' => 'replaced']);
+		self::assertSame('a', $stream->getHeader('123'), 'array_merge renumbered the key to 0; array_replace keeps it.');
+		self::assertSame('replaced', $stream->getHeader('x'));
+		self::assertSame('1', $stream->getHeader('z'));
+	}
+
+	public function testCloseCancelsWhenThePeerIsStillSending()
+	{
+		$session = $this->createMock(TH2Session::class);
+		$session->expects(self::once())->method('resetStream')->with(5, \Prado\IO\Http2\TNgHttp2::CANCEL);
+		$session->expects(self::never())->method('resumeStream');
+		$stream = new TH2Stream($session, 5, []);
+		$stream->pushIncoming('partial');
+		$stream->close();
+		$stream->close();   // idempotent: no second reset
+		self::assertFalse($stream->isReadable());
+	}
+
+	public function testCloseEndsTheLocalSideWhenThePeerHasFinished()
+	{
+		$session = $this->createMock(TH2Session::class);
+		$session->expects(self::never())->method('resetStream');
+		$session->expects(self::once())->method('resumeStream')->with(5);
+		$stream = new TH2Stream($session, 5, []);
+		$stream->markRemoteClosed();
+		$stream->close();
+		self::assertFalse($stream->isWritable());
+	}
+
+	public function testCloseAfterBothSidesEndedTouchesNothing()
+	{
+		$session = $this->createMock(TH2Session::class);
+		$session->expects(self::never())->method('resetStream');
+		$session->expects(self::never())->method('resumeStream');
+		$stream = new TH2Stream($session, 5, []);
+		$stream->markClosed();   // nghttp2 already closed it
+		$stream->close();
+		self::assertTrue($stream->eof());
+	}
+
+	public function testCloseSurvivesAClosedSession()
+	{
+		$session = $this->createMock(TH2Session::class);
+		$session->method('resetStream')->willThrowException(new \Prado\IO\Http2\THttp2Exception('http2_session_closed'));
+		$stream = new TH2Stream($session, 5, []);
+		$stream->close();
+		self::assertFalse($stream->isReadable());
+	}
+
+	/**
+	 * A stream exposing its raw buffers, to observe compaction and dropped bytes.
+	 */
+	private function spyStream()
+	{
+		$session = $this->createMock(TH2Session::class);
+		return new class ($session, 1) extends TH2Stream {
+			public function rawIncoming(): string
+			{
+				return $this->getIncomingDirect();
+			}
+
+			public function rawOutgoing(): string
+			{
+				return $this->getOutgoingDirect();
+			}
+		};
+	}
+
+	/** @return string $length bytes whose every 4-byte word is its own index, so a reorder or loss is detectable. */
+	private function pattern(int $length): string
+	{
+		$words = [];
+		for ($i = 0, $n = intdiv($length, 4); $i < $n; $i++) {
+			$words[] = pack('N', $i);
+		}
+		return implode('', $words);
+	}
 }

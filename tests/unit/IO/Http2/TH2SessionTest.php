@@ -908,4 +908,384 @@ class TH2SessionTest extends PHPUnit\Framework\TestCase
 		$server->close();
 		$client->close();
 	}
+
+	public function testHandlerExceptionIsRethrownAfterReceiveAndTheSessionStaysUsable()
+	{
+		// PHP cannot throw out of an FFI callback (a fatal error). A handler's Throwable is held until
+		// nghttp2 returns, every frame in the input is still processed, and receive() rethrows it.
+		[$server, $client] = $this->newPair();
+		$serverStream = null;
+		$server->attachEventHandler('onRequest', function ($s, $stream) use ($server, &$serverStream) {
+			$server->respond($stream, [':status' => '200']);
+			$serverStream = $stream;
+		});
+		$chunks = [];
+		$server->attachEventHandler('onData', function ($s, $stream) use (&$chunks) {
+			$chunks[] = $stream->getContents();
+			if (count($chunks) === 1) {
+				throw new \LogicException('handler boom');
+			}
+		});
+		$request = $client->request([':method' => 'POST', ':scheme' => 'http', ':authority' => 'h', ':path' => '/']);
+		$server->receive($client->send());
+		$client->receive($server->send());
+		$request->write('A');
+		$bytes = $client->send();
+		$request->write('B');
+		$bytes .= $client->send();
+		$request->markLocalClosed();
+		$bytes .= $client->send();
+
+		try {
+			$server->receive($bytes);
+			self::fail('receive() rethrows the handler exception.');
+		} catch (\LogicException $e) {
+			self::assertSame('handler boom', $e->getMessage());
+		}
+		self::assertSame(['A', 'B'], $chunks, 'The frames after the throwing handler were still delivered.');
+		self::assertTrue($server->getStream(1)->eof(), 'END_STREAM after the throwing handler was processed.');
+
+		$closed = false;
+		$client->attachEventHandler('onClose', function () use (&$closed) {
+			$closed = true;
+		});
+		$serverStream->markLocalClosed();
+		$this->pump($server, $client);
+		self::assertTrue($closed, 'The session stays usable: the response completed.');
+		$server->close();
+		$client->close();
+	}
+
+	public function testDataProviderFailureResetsOnlyItsStream()
+	{
+		// A Throwable inside the data provider returns NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE: nghttp2
+		// resets that stream, send() rethrows, and the session serves the next request.
+		[$server, $client] = $this->newPair();
+		$requests = 0;
+		$server->attachEventHandler('onRequest', function ($s, $stream) use ($server, &$requests) {
+			$requests++;
+			$server->respond($stream, [':status' => '200']);
+			if ($requests === 1) {
+				$stream->write('body');
+				$stream->sendTrailers(['X-Dup' => '1', 'x-dup' => '2']);   // normalizeHeaders() throws inside the provider
+			} else {
+				$stream->markLocalClosed();
+			}
+		});
+		$closedStreams = [];
+		$client->attachEventHandler('onClose', function ($s, $stream) use (&$closedStreams) {
+			$closedStreams[] = $stream->getStreamId();
+		});
+		$first = $client->request([':method' => 'GET', ':scheme' => 'http', ':authority' => 'h', ':path' => '/']);
+		$first->markLocalClosed();
+
+		$caught = null;
+		try {
+			$this->pump($server, $client);
+		} catch (THttp2Exception $e) {
+			$caught = $e;
+		}
+		self::assertNotNull($caught, 'send() rethrows the Throwable raised inside the data provider.');
+		self::assertStringContainsString('x-dup', $caught->getMessage());
+		$this->pump($server, $client);
+		self::assertSame([1], $closedStreams, 'nghttp2 reset the failing stream.');
+
+		$second = $client->request([':method' => 'GET', ':scheme' => 'http', ':authority' => 'h', ':path' => '/2']);
+		$second->markLocalClosed();
+		$this->pump($server, $client);
+		self::assertSame(2, $requests, 'The session served the next request.');
+		self::assertSame([1, 3], $closedStreams);
+		$server->close();
+		$client->close();
+	}
+
+	public function testCloseInsideAHandlerIsDeferredUntilNghttp2Returns()
+	{
+		// Freeing the nghttp2 session from inside one of its callbacks is a use-after-free (it
+		// crashed the process). close() now takes effect for PHP at once and frees nghttp2 after.
+		[$server, $client] = $this->newPair();
+		$requests = 0;
+		$server->attachEventHandler('onRequest', function ($s, $stream) use ($server, &$requests) {
+			$requests++;
+			$server->close();
+			$server->close();   // idempotent inside the callback too
+		});
+		$client->request([':method' => 'GET', ':scheme' => 'http', ':authority' => 'h', ':path' => '/']);
+		$client->request([':method' => 'GET', ':scheme' => 'http', ':authority' => 'h', ':path' => '/2']);
+
+		$server->receive($client->send());
+		self::assertSame(1, $requests, 'The second request reached a closed session and was dropped.');
+		self::assertFalse($server->wantsIo(), 'The session is closed once receive() returns.');
+		$this->expectException(THttp2Exception::class);
+		$server->send();
+	}
+
+	public function testClientDeclinesServerPushByDefault()
+	{
+		$client = new TH2Session(false);
+		$client->submitSettings([]);
+		$client->request([':method' => 'GET', ':scheme' => 'http', ':authority' => 'h', ':path' => '/']);
+
+		$ffi = TNgHttp2::ffi();
+		$cbs = $ffi->new('nghttp2_session_callbacks*');
+		$ffi->nghttp2_session_callbacks_new(\FFI::addr($cbs));
+		$raw = $ffi->new('nghttp2_session*');
+		$ffi->nghttp2_session_server_new(\FFI::addr($raw), $cbs, null);
+		$ffi->nghttp2_submit_settings($raw, 0, null, 0);   // the server preface; the client applies its settings after it
+		$this->rawFeed($ffi, $raw, $client->send());
+		$client->receive($this->rawDrain($ffi, $raw));   // the peer's SETTINGS ACK puts the local settings in effect
+		self::assertSame(0, $client->getLocalSetting(TNgHttp2::SETTINGS_ENABLE_PUSH), 'A client advertises SETTINGS_ENABLE_PUSH 0 unless told otherwise.');
+		$keep = [];
+		$nva = $this->rawNv($ffi, [[':method', 'GET'], [':scheme', 'http'], [':authority', 'h'], [':path', '/pushed.css']], $keep);
+		self::assertGreaterThan(0, $ffi->nghttp2_submit_push_promise($raw, 0, 1, $nva, 4, null), 'nghttp2 queues the push and refuses it at send time.');
+		self::assertNotContains(TNgHttp2::FRAME_PUSH_PROMISE, $this->frameTypes($this->rawDrain($ffi, $raw)), 'No PUSH_PROMISE reaches a client that declined push.');
+		$ffi->nghttp2_session_del($raw);
+		$ffi->nghttp2_session_callbacks_del($cbs);
+
+		[$server, $opted] = $this->newPair();
+		$opted->submitSettings([TNgHttp2::SETTINGS_ENABLE_PUSH => 1]);
+		$this->pump($server, $opted, 2);
+		self::assertSame(1, $opted->getLocalSetting(TNgHttp2::SETTINGS_ENABLE_PUSH), 'An explicit value is kept.');
+		$opted->close();
+		$server->close();
+		$client->close();
+	}
+
+	public function testPushedStreamHeadersDoNotPolluteTheRequestStream()
+	{
+		// A PUSH_PROMISE header block arrives under the associated request stream's id. It used to be
+		// kept as pending headers and merged into the real response (the request's :path became the
+		// pushed path). Pushed streams have no TH2Stream; their headers are ignored.
+		$client = new TH2Session(false);
+		$client->submitSettings([TNgHttp2::SETTINGS_ENABLE_PUSH => 1]);
+		$events = [];
+		foreach (['onResponse', 'onTrailers', 'onInformationalResponse', 'onData', 'onClose'] as $event) {
+			$client->attachEventHandler($event, function ($s, $stream) use (&$events, $event) {
+				$events[] = $event . ':' . $stream->getStreamId();
+			});
+		}
+		$request = $client->request([':method' => 'GET', ':scheme' => 'http', ':authority' => 'h', ':path' => '/']);
+		$request->markLocalClosed();
+
+		$ffi = TNgHttp2::ffi();
+		$cbs = $ffi->new('nghttp2_session_callbacks*');
+		$ffi->nghttp2_session_callbacks_new(\FFI::addr($cbs));
+		$raw = $ffi->new('nghttp2_session*');
+		$ffi->nghttp2_session_server_new(\FFI::addr($raw), $cbs, null);
+		$ffi->nghttp2_submit_settings($raw, 0, null, 0);
+		$this->rawFeed($ffi, $raw, $client->send());
+		$client->receive($this->rawDrain($ffi, $raw));
+		$this->rawFeed($ffi, $raw, $client->send());
+
+		$keep = [];
+		$promised = $ffi->nghttp2_submit_push_promise($raw, 0, 1, $this->rawNv($ffi, [[':method', 'GET'], [':scheme', 'http'], [':authority', 'h'], [':path', '/pushed.css']], $keep), 4, null);
+		self::assertSame(2, $promised, 'The server pushed stream 2.');
+		self::assertSame(0, $ffi->nghttp2_submit_response2($raw, 1, $this->rawNv($ffi, [[':status', '200'], ['x-main', 'yes']], $keep), 2, null));
+		self::assertSame(0, $ffi->nghttp2_submit_response2($raw, $promised, $this->rawNv($ffi, [[':status', '200'], ['x-pushed', 'yes']], $keep), 2, null));
+		for ($i = 0; $i < 4; $i++) {
+			$client->receive($this->rawDrain($ffi, $raw));
+			$this->rawFeed($ffi, $raw, $client->send());
+		}
+		$ffi->nghttp2_session_del($raw);
+		$ffi->nghttp2_session_callbacks_del($cbs);
+
+		self::assertSame('/', $request->getHeader(':path'), 'The request stream keeps its own :path.');
+		self::assertSame('200', $request->getHeader(':status'));
+		self::assertSame('yes', $request->getHeader('x-main'));
+		self::assertNull($request->getHeader('x-pushed'), 'The pushed response went to no TH2Stream.');
+		self::assertSame(['onResponse:1', 'onClose:1'], $events, 'Only the request stream raised events.');
+		$client->close();
+	}
+
+	public function testStreamCloseEndsTheStreamWhenThePeerHasFinished()
+	{
+		// close() on a headers-only response used to leave the deferred provider parked forever: the
+		// peer never got END_STREAM. It now resumes the stream so END_STREAM goes out.
+		[$server, $client] = $this->newPair();
+		$serverStream = null;
+		$server->attachEventHandler('onRequest', function ($s, $stream) use ($server, &$serverStream) {
+			$server->respond($stream, [':status' => '204']);
+			$serverStream = $stream;
+		});
+		$closed = false;
+		$client->attachEventHandler('onClose', function () use (&$closed) {
+			$closed = true;
+		});
+		$request = $client->request([':method' => 'GET', ':scheme' => 'http', ':authority' => 'h', ':path' => '/']);
+		$request->markLocalClosed();
+		$this->pump($server, $client, 2);
+		self::assertFalse($request->eof(), 'The response has not ended before close().');
+
+		$serverStream->close();
+		$this->pump($server, $client);
+		self::assertTrue($closed, 'The peer saw END_STREAM.');
+		self::assertTrue($request->eof());
+		self::assertSame('204', $request->getHeader(':status'));
+		$server->close();
+		$client->close();
+	}
+
+	public function testStreamCloseCancelsAPeerThatIsStillSending()
+	{
+		[$server, $client] = $this->newPair();
+		$serverStream = null;
+		$server->attachEventHandler('onRequest', function ($s, $stream) use ($server, &$serverStream) {
+			$server->respond($stream, [':status' => '200']);
+			$serverStream = $stream;
+		});
+		$closed = false;
+		$client->attachEventHandler('onClose', function () use (&$closed) {
+			$closed = true;
+		});
+		$request = $client->request([':method' => 'POST', ':scheme' => 'http', ':authority' => 'h', ':path' => '/upload']);
+		$request->write('part one');
+		$this->pump($server, $client, 2);
+		self::assertTrue($request->isWritable(), 'The client is still uploading.');
+
+		$serverStream->close();
+		$this->pump($server, $client);
+		self::assertTrue($closed, 'The server cancelled the stream (RST_STREAM) rather than sending a truncated response.');
+		self::assertFalse($request->isWritable());
+		$serverStream->close();   // idempotent: nothing more is submitted
+		$server->close();
+		$client->close();
+	}
+
+	public function testPseudoHeadersAreSentFirstWhateverTheGivenOrder()
+	{
+		// A pseudo-header after a regular field is malformed (RFC 9113 §8.3): nghttp2 submitted it as
+		// given and the peer reset the stream with no onRequest. The headers are reordered on submit.
+		[$server, $client] = $this->newPair();
+		$headers = null;
+		$server->attachEventHandler('onRequest', function ($s, $stream) use (&$headers) {
+			$headers = $stream->getHeaders();
+		});
+		$request = $client->request(['x-first' => '1', ':method' => 'GET', ':scheme' => 'http', ':authority' => 'h', 'X-Second' => '2', ':path' => '/']);
+		self::assertSame([':method', ':scheme', ':authority', ':path', 'x-first', 'x-second'], array_keys($request->getHeaders()), 'The stream keeps the normalized order.');
+		$request->markLocalClosed();
+		$this->pump($server, $client, 2);
+		self::assertNotNull($headers, 'The server accepted the request.');
+		self::assertSame('1', $headers['x-first']);
+		self::assertSame('2', $headers['x-second']);
+		$server->close();
+		$client->close();
+	}
+
+	public function testHeaderNamesDifferingOnlyByCaseAreRejected()
+	{
+		$client = new TH2Session(false);
+		$client->submitSettings([]);
+		try {
+			$client->request([':method' => 'GET', ':scheme' => 'http', ':authority' => 'h', ':path' => '/', 'X-Tag' => 'a', 'x-tag' => 'b']);
+			self::fail('A repeated name throws.');
+		} catch (THttp2Exception $e) {
+			self::assertStringContainsString('x-tag', $e->getMessage());
+		}
+		self::assertNull($client->getStream(1), 'Nothing was submitted.');
+		$client->close();
+	}
+
+	public function testPendingHeadersAreDroppedWhenAStreamIsResetMidBlock()
+	{
+		// nghttp2 resets a request with a connection-specific header while its block is still being
+		// delivered: on_frame_recv never runs for it, so the pending entry has to go with the stream.
+		$server = new class (true) extends TH2Session {
+			public function pendingHeaderBlocks(): array
+			{
+				return $this->getPendingHeadersDirect();
+			}
+		};
+		$client = new TH2Session(false);
+		$server->submitSettings([]);
+		$client->submitSettings([]);
+		$client->request([':method' => 'GET', ':scheme' => 'http', ':authority' => 'h', ':path' => '/', 'connection' => 'keep-alive']);
+		$this->pump($server, $client, 2);
+		self::assertSame([], $server->pendingHeaderBlocks(), 'No header block lingers for the reset stream.');
+		$server->close();
+		$client->close();
+	}
+
+	/**
+	 * @return array{TH2Session, TH2Session} A server and a client session with settings submitted.
+	 */
+	private function newPair(): array
+	{
+		$server = new TH2Session(true);
+		$client = new TH2Session(false);
+		$server->submitSettings([]);
+		$client->submitSettings([]);
+		return [$server, $client];
+	}
+
+	private function pump(TH2Session $server, TH2Session $client, int $rounds = 8): void
+	{
+		for ($i = 0; $i < $rounds; $i++) {
+			$server->receive($client->send());
+			$client->receive($server->send());
+		}
+	}
+
+	/**
+	 * Builds an nghttp2_nv[] for a raw nghttp2 session; $keep holds the byte buffers alive.
+	 * @param \FFI $ffi The bound nghttp2 FFI instance.
+	 * @param array<int, array{string, string}> $pairs The name/value pairs.
+	 * @param array<int, mixed> &$keep Receives the name/value buffers.
+	 */
+	private function rawNv(\FFI $ffi, array $pairs, array &$keep): \FFI\CData
+	{
+		$nva = $ffi->new('nghttp2_nv[' . count($pairs) . ']');
+		foreach ($pairs as $i => [$name, $value]) {
+			$nameBuf = $ffi->new('uint8_t[' . (strlen($name) + 1) . ']');
+			$valueBuf = $ffi->new('uint8_t[' . (strlen($value) + 1) . ']');
+			\FFI::memcpy($nameBuf, $name, strlen($name));
+			\FFI::memcpy($valueBuf, $value, strlen($value));
+			$nva[$i]->name = $ffi->cast('uint8_t*', $nameBuf);
+			$nva[$i]->value = $ffi->cast('uint8_t*', $valueBuf);
+			$nva[$i]->namelen = strlen($name);
+			$nva[$i]->valuelen = strlen($value);
+			$nva[$i]->flags = TNgHttp2::NV_FLAG_NONE;
+			$keep[] = $nameBuf;
+			$keep[] = $valueBuf;
+		}
+		return $nva;
+	}
+
+	private function rawFeed(\FFI $ffi, \FFI\CData $raw, string $bytes): void
+	{
+		if ($bytes === '') {
+			return;
+		}
+		$buffer = $ffi->new('uint8_t[' . strlen($bytes) . ']');
+		\FFI::memcpy($buffer, $bytes, strlen($bytes));
+		self::assertGreaterThanOrEqual(0, $ffi->nghttp2_session_mem_recv2($raw, $ffi->cast('uint8_t*', $buffer), strlen($bytes)), 'The raw peer accepted the bytes.');
+	}
+
+	/**
+	 * @param string $bytes
+	 * @return int[] The frame types in a byte sequence of whole HTTP/2 frames.
+	 */
+	private function frameTypes(string $bytes): array
+	{
+		$types = [];
+		for ($offset = 0; $offset + 9 <= strlen($bytes);) {
+			$length = unpack('N', "\0" . substr($bytes, $offset, 3))[1];
+			$types[] = ord($bytes[$offset + 3]);
+			$offset += 9 + $length;
+		}
+		return $types;
+	}
+
+	private function rawDrain(\FFI $ffi, \FFI\CData $raw): string
+	{
+		$out = '';
+		while (true) {
+			$pointer = $ffi->new('uint8_t*');
+			$n = $ffi->nghttp2_session_mem_send2($raw, \FFI::addr($pointer));
+			if ($n <= 0) {
+				break;
+			}
+			$out .= \FFI::string($pointer, $n);
+		}
+		return $out;
+	}
 }

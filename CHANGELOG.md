@@ -5,7 +5,25 @@ All notable changes to `belisoful/prado-http2` are recorded here. The format fol
 
 ## [Unreleased]
 
+### Added
+- `TNgHttp2::MIN_VERSION` (`1.60.0`, where nghttp2's `nghttp2_ssize` API arrived). Each candidate library is probed for its version before the full declaration is bound; an older one is reported through the new error code `http2_library_too_old` (version found, path, version required) instead of a symbol-resolution failure.
+- Error code `http2_header_duplicate`: `request()`, `respond()` and `submitTrailers()` reject a header name given twice in different letter case. Pseudo-headers are sent first whatever the given order (RFC 9113 §8.3); `request()` keeps the normalized order on the stream.
+- `TNgHttp2::FRAME_PUSH_PROMISE`, `TNgHttp2::ERR_TEMPORAL_CALLBACK_FAILURE`, `TNgHttp2::ERR_PUSH_DISABLED`; `nghttp2_submit_push_promise` in the FFI declaration.
+- `TH2Stream` tracks a consumed offset per buffer (`IncomingOffset`, `OutgoingOffset` self-encapsulated accessors) and compacts once the consumed prefix is large.
+
+### Fixed
+- A Throwable raised by an event handler (or by the extension) inside an nghttp2 callback was a PHP fatal error ("Throwing from FFI callbacks is not allowed") that ended the process. It is now held while nghttp2 finishes the `receive()`/`send()` call and rethrown from that call; the remaining frames are still processed and the session stays usable. Bytes a throwing `send()` produced are returned by the next `send()`. A Throwable inside the data provider resets only its stream (`NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE`).
+- `TH2Session::close()` from inside an event handler freed the nghttp2 session while it was executing (a segmentation fault). The PHP side now closes at once and nghttp2 is freed when the call returns.
+- A server PUSH_PROMISE polluted the client's request stream: its header block was kept as pending headers under the request stream's id and merged into the real response, so the request's `:path` became the pushed path. Push header blocks are ignored, `handleBeginHeaders()` resets the pending block, and `handleStreamClose()` drops the block of a stream reset mid-HEADERS.
+- `TH2Stream::close()` and `detach()` never ended the stream on the wire: a headers-only response's deferred provider was never resumed, so the peer waited for END_STREAM forever. `close()` now cancels a peer that is still sending (RST_STREAM CANCEL) or ends the local side (END_STREAM) when the peer has finished, is idempotent, and `pushIncoming()` drops bytes for a detached stream instead of buffering them.
+- Draining a large body was quadratic: `drainOutgoing()` rebuilt the remaining buffer for every 16 KiB frame (16 MiB took 0.78 s in-process; now 0.05 s). `read()` had the same shape.
+- A regular header placed before the pseudo-headers passed submit and the peer reset the stream (the client saw only `onClose`, the server never raised `onRequest`).
+- `mergeHeaders()` renumbered a digit-only header name (`array_merge`), so `getHeader('123')` returned null after a merge.
+- `sendTrailers()` after the body had already ended was silently dropped; it now throws `RuntimeException`, as `write()` does.
+
 ### Changed
+- A client session declines server push: `submitSettings()` adds `SETTINGS_ENABLE_PUSH => 0` unless the caller sets that id (pushed streams have no `TH2Stream` and are discarded in any case).
+- CI runs on `ubuntu-26.04`: Ubuntu 24.04's libnghttp2 1.59.0 predates the API this binding declares, so FFI failed to load there and every nghttp2 test was skipped on every run while the workflow stayed green. A step now fails the run when the library or an HTTP/2 `curl` is unusable.
 - PHP 8.2 is the minimum (`"php": ">=8.2.0"`), following PRADO 4.4, which dropped PHP 8.1 (pradosoft/prado#1290). CI covers PHP 8.2 to 8.5 and the Composer platform is 8.2.
 - PHPStan runs at level 4 with `treatPhpDocTypesAsCertain: false`, matching the framework.
 - CI uses `actions/checkout@v7` and `actions/cache@v6`; the dependency cache keys on `composer.json` per PHP version (the lock file is not committed) and the job times out after 30 minutes.
@@ -16,6 +34,8 @@ All notable changes to `belisoful/prado-http2` are recorded here. The format fol
 
 ### Upgrading
 - Run on PHP 8.2 or later. PHP 8.1 is no longer supported: PRADO 4.4 does not install on it.
+- libnghttp2 1.60.0 or newer is required (it always was; the failure is now named). Ubuntu 24.04 ships 1.59.0.
+- An exception thrown by an event handler now surfaces from `receive()` or `send()` instead of ending the process; catch it there. A client that relies on server push must pass `SETTINGS_ENABLE_PUSH => 1` to `submitSettings()`. `TH2Stream::close()` now sends RST_STREAM or END_STREAM; use `markLocalClosed()` to finish a body gracefully, as before.
 
 ## [1.1.0] - 2026-09-22
 

@@ -26,14 +26,18 @@ use Psr\Http\Message\StreamInterface;
  * throws.  Reads are non-blocking: {@see read()} returns the buffered bytes, or '' when none
  * have arrived yet.  The stream is at {@see eof()} once the peer half-closes and the buffer is
  * drained.  {@see markLocalClosed()} finishes a finite body: the queued bytes flush and the
- * stream then ends (END_STREAM), unlike {@see close()}, which discards the buffers and leaves
- * the stream detached.  Once nghttp2 closes the stream (peer reset, completion, or session
- * close) the session marks both directions closed: buffered bytes stay readable, a write throws.
- * A {@see read()}, {@see getContents()}, or {@see write()} on a detached stream throws, per PSR-7.
+ * stream then ends (END_STREAM).  {@see close()} discards the buffers, detaches the stream, and
+ * ends it on the wire: a peer that is still sending is cancelled (RST_STREAM CANCEL); otherwise
+ * this side ends (END_STREAM).  Once nghttp2 closes the stream (peer reset, completion, or
+ * session close) the session marks both directions closed: buffered bytes stay readable, a write
+ * throws.  A {@see read()}, {@see getContents()}, or {@see write()} on a detached stream throws,
+ * per PSR-7.
  *
  * State is self-encapsulated: every field is reached through a protected `get*Direct()`/
  * `set*Direct()` accessor (the byte buffers return by reference), so a subclass can intercept
- * any of it.
+ * any of it.  Each buffer is consumed from the front through an offset (`IncomingOffset`,
+ * `OutgoingOffset`) and compacted once the consumed prefix is large, so draining a large body is
+ * linear.
  *
  * @author Brad Anderson <belisoful@icloud.com>
  * @since 1.0.0
@@ -41,6 +45,9 @@ use Psr\Http\Message\StreamInterface;
  */
 class TH2Stream extends TComponent implements StreamInterface
 {
+	/** @var int The consumed prefix length at which a buffer is compacted (once it is at least half consumed). */
+	private const COMPACT_THRESHOLD = 1048576;
+
 	/** @var TH2Session The owning session. */
 	private TH2Session $_session;
 
@@ -50,11 +57,17 @@ class TH2Stream extends TComponent implements StreamInterface
 	/** @var array<string, string> The stream's headers, including pseudo-headers. */
 	private array $_headers;
 
-	/** @var string Bytes received from the peer, awaiting a read. */
+	/** @var string Bytes received from the peer, awaiting a read; the first {@see $_incomingOffset} bytes are consumed. */
 	private string $_incoming = '';
 
-	/** @var string Bytes written locally, awaiting outgoing DATA frames. */
+	/** @var int The length of the consumed prefix of {@see $_incoming}. */
+	private int $_incomingOffset = 0;
+
+	/** @var string Bytes written locally, awaiting outgoing DATA frames; the first {@see $_outgoingOffset} bytes are sent. */
 	private string $_outgoing = '';
+
+	/** @var int The length of the consumed prefix of {@see $_outgoing}. */
+	private int $_outgoingOffset = 0;
 
 	/** @var bool Whether the peer has half-closed (no more incoming DATA). */
 	private bool $_remoteClosed = false;
@@ -128,7 +141,8 @@ class TH2Stream extends TComponent implements StreamInterface
 	}
 
 	/**
-	 * Returns the raw incoming buffer by reference, for in-place mutation.
+	 * Returns the raw incoming buffer by reference, for in-place mutation.  Its first
+	 * {@see getIncomingOffsetDirect()} bytes are already consumed.
 	 * @return string The incoming bytes, by reference.
 	 */
 	protected function &getIncomingDirect(): string
@@ -137,16 +151,38 @@ class TH2Stream extends TComponent implements StreamInterface
 	}
 
 	/**
-	 * Sets the raw incoming buffer.
+	 * Sets the raw incoming buffer and resets its consumed prefix.
 	 * @param string $value The incoming bytes.
 	 */
 	protected function setIncomingDirect(string $value): void
 	{
 		$this->_incoming = $value;
+		$this->_incomingOffset = 0;
 	}
 
 	/**
-	 * Returns the raw outgoing buffer by reference, for in-place mutation.
+	 * Returns the length of the consumed prefix of the incoming buffer.
+	 * @return int The consumed prefix length.
+	 * @since 1.2.0
+	 */
+	protected function getIncomingOffsetDirect(): int
+	{
+		return $this->_incomingOffset;
+	}
+
+	/**
+	 * Sets the length of the consumed prefix of the incoming buffer.
+	 * @param int $value The consumed prefix length.
+	 * @since 1.2.0
+	 */
+	protected function setIncomingOffsetDirect(int $value): void
+	{
+		$this->_incomingOffset = $value;
+	}
+
+	/**
+	 * Returns the raw outgoing buffer by reference, for in-place mutation.  Its first
+	 * {@see getOutgoingOffsetDirect()} bytes are already sent.
 	 * @return string The outgoing bytes, by reference.
 	 */
 	protected function &getOutgoingDirect(): string
@@ -155,12 +191,33 @@ class TH2Stream extends TComponent implements StreamInterface
 	}
 
 	/**
-	 * Sets the raw outgoing buffer.
+	 * Sets the raw outgoing buffer and resets its consumed prefix.
 	 * @param string $value The outgoing bytes.
 	 */
 	protected function setOutgoingDirect(string $value): void
 	{
 		$this->_outgoing = $value;
+		$this->_outgoingOffset = 0;
+	}
+
+	/**
+	 * Returns the length of the consumed prefix of the outgoing buffer.
+	 * @return int The consumed prefix length.
+	 * @since 1.2.0
+	 */
+	protected function getOutgoingOffsetDirect(): int
+	{
+		return $this->_outgoingOffset;
+	}
+
+	/**
+	 * Sets the length of the consumed prefix of the outgoing buffer.
+	 * @param int $value The consumed prefix length.
+	 * @since 1.2.0
+	 */
+	protected function setOutgoingOffsetDirect(int $value): void
+	{
+		$this->_outgoingOffset = $value;
 	}
 
 	/**
@@ -302,11 +359,15 @@ class TH2Stream extends TComponent implements StreamInterface
 	// =========================================================================
 
 	/**
-	 * Appends received DATA bytes to the incoming buffer (called by {@see TH2Session}).
+	 * Appends received DATA bytes to the incoming buffer (called by {@see TH2Session}).  A detached
+	 * stream drops them: nothing can read them.
 	 * @param string $bytes The received bytes.
 	 */
 	public function pushIncoming(string $bytes): void
 	{
+		if ($this->getDetachedDirect()) {
+			return;
+		}
 		$incoming = &$this->getIncomingDirect();
 		$incoming .= $bytes;
 	}
@@ -318,20 +379,47 @@ class TH2Stream extends TComponent implements StreamInterface
 	 */
 	public function drainOutgoing(int $length): string
 	{
-		$outgoing = &$this->getOutgoingDirect();
-		if ($outgoing === '') {
+		if (!$this->hasOutgoing() || $length <= 0) {
 			return '';
 		}
-		$take = min($length, strlen($outgoing));
-		$bytes = substr($outgoing, 0, $take);
-		$outgoing = substr($outgoing, $take);
+		$outgoing = &$this->getOutgoingDirect();
+		$offset = $this->getOutgoingOffsetDirect();
+		$bytes = substr($outgoing, $offset, $length);
+		$this->setOutgoingOffsetDirect(self::advance($outgoing, $offset + strlen($bytes)));
 		return $bytes;
 	}
 
 	/** @return bool Whether outgoing bytes are queued for sending. */
 	public function hasOutgoing(): bool
 	{
-		return $this->getOutgoingDirect() !== '';
+		return strlen($this->getOutgoingDirect()) > $this->getOutgoingOffsetDirect();
+	}
+
+	/** @return bool Whether received bytes are buffered, awaiting a read. */
+	private function hasIncoming(): bool
+	{
+		return strlen($this->getIncomingDirect()) > $this->getIncomingOffsetDirect();
+	}
+
+	/**
+	 * Moves a buffer's consumed prefix to $offset.  A fully consumed buffer is emptied; a buffer whose
+	 * consumed prefix is at least {@see COMPACT_THRESHOLD} and at least half of it is compacted.  Each
+	 * byte is copied at most a bounded number of times, so draining stays linear.
+	 * @param string &$buffer The buffer, by reference.
+	 * @param int $offset The new consumed prefix length.
+	 * @return int The consumed prefix length after compaction.
+	 */
+	private static function advance(string &$buffer, int $offset): int
+	{
+		if ($offset >= strlen($buffer)) {
+			$buffer = '';
+			return 0;
+		}
+		if ($offset >= self::COMPACT_THRESHOLD && $offset * 2 >= strlen($buffer)) {
+			$buffer = substr($buffer, $offset);
+			return 0;
+		}
+		return $offset;
 	}
 
 	/** @return bool Whether this side has finished writing. */
@@ -397,9 +485,14 @@ class TH2Stream extends TComponent implements StreamInterface
 	 * {@see markLocalClosed()}.  The trailers are submitted by the data provider once the body has
 	 * drained, as nghttp2 requires.
 	 * @param array<string, string> $headers The trailing header name => value pairs.
+	 * @throws \RuntimeException When this side already finished (closed, detached, or local-closed):
+	 *   the body has ended, so nothing can carry the trailers.
 	 */
 	public function sendTrailers(array $headers): void
 	{
+		if ($this->getDetachedDirect() || $this->getLocalClosedDirect()) {
+			throw new \RuntimeException('Cannot send trailers on an HTTP/2 stream whose local side is closed.');
+		}
 		$this->setTrailersDirect($headers);
 		$this->setTrailersPendingDirect(true);
 		$this->setLocalClosedDirect(true);
@@ -416,12 +509,14 @@ class TH2Stream extends TComponent implements StreamInterface
 	}
 
 	/**
-	 * Merges additional headers into the stream (e.g. response headers on the client side).
+	 * Merges additional headers into the stream (e.g. response headers on the client side); a name
+	 * already present takes the new value.  Keys are kept as given, so a digit-only field name such
+	 * as `123` survives (PHP stores it as an integer key).
 	 * @param array<string, string> $headers The headers to merge.
 	 */
 	public function mergeHeaders(array $headers): void
 	{
-		$this->setHeadersDirect(array_merge($this->getHeadersDirect(), $headers));
+		$this->setHeadersDirect(array_replace($this->getHeadersDirect(), $headers));
 	}
 
 	// =========================================================================
@@ -463,12 +558,13 @@ class TH2Stream extends TComponent implements StreamInterface
 		if ($length < 0) {
 			throw new \RuntimeException('Length parameter cannot be negative.');
 		}
-		$incoming = &$this->getIncomingDirect();
-		if ($length === 0 || $incoming === '') {
+		if ($length === 0 || !$this->hasIncoming()) {
 			return '';
 		}
-		$bytes = substr($incoming, 0, $length);
-		$incoming = substr($incoming, strlen($bytes));
+		$incoming = &$this->getIncomingDirect();
+		$offset = $this->getIncomingOffsetDirect();
+		$bytes = substr($incoming, $offset, $length);
+		$this->setIncomingOffsetDirect(self::advance($incoming, $offset + strlen($bytes)));
 		$this->setReadPositionDirect($this->getReadPositionDirect() + strlen($bytes));
 		return $bytes;
 	}
@@ -483,24 +579,44 @@ class TH2Stream extends TComponent implements StreamInterface
 		if ($this->getDetachedDirect()) {
 			throw new \RuntimeException('Cannot read from a detached or closed HTTP/2 stream.');
 		}
-		$incoming = &$this->getIncomingDirect();
-		$bytes = $incoming;
-		$incoming = '';
+		$bytes = substr($this->getIncomingDirect(), $this->getIncomingOffsetDirect());
+		$this->setIncomingDirect('');
 		$this->setReadPositionDirect($this->getReadPositionDirect() + strlen($bytes));
 		return $bytes;
 	}
 
 	/**
-	 * Closes the stream for both directions and clears its buffers.  The stream becomes unusable:
-	 * a later {@see read()}, {@see getContents()}, or {@see write()} throws (PSR-7).
+	 * Closes the stream for both directions, clears its buffers, and ends it on the wire.  A peer
+	 * that has not finished sending is cancelled (RST_STREAM CANCEL), so it cannot mistake the
+	 * discarded body for a complete one; a peer that has finished sees this side end (END_STREAM).
+	 * The stream becomes unusable: a later {@see read()}, {@see getContents()}, or {@see write()}
+	 * throws (PSR-7).  Idempotent, and a no-op on the wire once the session is closed.
 	 */
 	public function close(): void
 	{
+		if ($this->getDetachedDirect()) {
+			return;
+		}
+		$remoteOpen = !$this->getRemoteClosedDirect();
+		$localOpen = !$this->getLocalClosedDirect();
 		$this->setLocalClosedDirect(true);
 		$this->setRemoteClosedDirect(true);
 		$this->setDetachedDirect(true);
 		$this->setIncomingDirect('');
 		$this->setOutgoingDirect('');
+		$this->setTrailersPendingDirect(false);
+		$this->setTrailersDirect([]);
+		$session = $this->getSessionDirect();
+		if ($remoteOpen) {
+			try {
+				$session->resetStream($this->getStreamIdDirect());
+			} catch (THttp2Exception $e) {
+				// The session is closed; nghttp2 no longer has the stream.
+			}
+		} elseif ($localOpen) {
+			// The provider now finds nothing queued and the local side closed: it emits END_STREAM.
+			$session->resumeStream($this->getStreamIdDirect());
+		}
 	}
 
 	/**
@@ -516,7 +632,7 @@ class TH2Stream extends TComponent implements StreamInterface
 	/** @return bool Whether the peer has half-closed and the buffer is drained. */
 	public function eof(): bool
 	{
-		return $this->getRemoteClosedDirect() && $this->getIncomingDirect() === '';
+		return $this->getRemoteClosedDirect() && !$this->hasIncoming();
 	}
 
 	/** @return ?int Always null; an HTTP/2 stream length is unknown. */
@@ -535,7 +651,7 @@ class TH2Stream extends TComponent implements StreamInterface
 	public function isReadable(): bool
 	{
 		return !$this->getDetachedDirect()
-			&& (!$this->getRemoteClosedDirect() || $this->getIncomingDirect() !== '');
+			&& (!$this->getRemoteClosedDirect() || $this->hasIncoming());
 	}
 
 	/** @return bool Whether bytes can be written (true until this side closes or detaches). */

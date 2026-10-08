@@ -63,6 +63,12 @@ final class TNgHttp2
 	/** @var int The RST_STREAM frame type. */
 	public const FRAME_RST_STREAM = 0x03;
 
+	/**
+	 * @var int The PUSH_PROMISE frame type.
+	 * @since 1.2.0
+	 */
+	public const FRAME_PUSH_PROMISE = 0x05;
+
 	/** @var int The SETTINGS frame type. */
 	public const FRAME_SETTINGS = 0x04;
 
@@ -90,6 +96,18 @@ final class TNgHttp2
 	/** @var int The nghttp2 return code that defers a stream's DATA until resumed. */
 	public const ERR_DEFERRED = -508;
 
+	/**
+	 * @var int The nghttp2 callback return code that resets the current stream and keeps the session.
+	 * @since 1.2.0
+	 */
+	public const ERR_TEMPORAL_CALLBACK_FAILURE = -521;
+
+	/**
+	 * @var int The nghttp2 error for a PUSH_PROMISE submitted to a peer that disabled push.
+	 * @since 1.2.0
+	 */
+	public const ERR_PUSH_DISABLED = -528;
+
 	/** @var int The HTTP/2 error code for a clean close (RST_STREAM / GOAWAY). */
 	public const NO_ERROR = 0x00;
 
@@ -107,6 +125,22 @@ final class TNgHttp2
 
 	/** @var int The HTTP/2 CANCEL error code (the default for a reset stream). */
 	public const CANCEL = 0x08;
+
+	/**
+	 * @var string The oldest libnghttp2 this binding loads: the `nghttp2_ssize` API (`*_send2`,
+	 *   `*_recv2`, `*_request2`, `*_response2`, `data_provider2`, `error_callback2`) arrived in 1.60.0.
+	 * @since 1.2.0
+	 */
+	public const MIN_VERSION = '1.60.0';
+
+	/** @var int {@see MIN_VERSION} as nghttp2's `version_num` (`major << 16 | minor << 8 | patch`). */
+	private const MIN_VERSION_NUM = 0x013c00;
+
+	/** @var string The declarations of the version probe, valid for every libnghttp2 release. */
+	private const PROBE_CDEF = <<<'C'
+		typedef struct { int age; int version_num; const char *version_str; const char *proto_str; } nghttp2_info;
+		nghttp2_info *nghttp2_version(int least_version);
+		C;
 
 	/** @var string The C declarations bound from libnghttp2. */
 	private const CDEF = <<<'C'
@@ -136,6 +170,7 @@ final class TNgHttp2
 		int nghttp2_submit_response2(nghttp2_session *session, int32_t stream_id, const nghttp2_nv *nva, size_t nvlen, const nghttp2_data_provider2 *data_prd);
 		int32_t nghttp2_submit_request2(nghttp2_session *session, const void *pri_spec, const nghttp2_nv *nva, size_t nvlen, const nghttp2_data_provider2 *data_prd, void *stream_user_data);
 		int nghttp2_submit_trailer(nghttp2_session *session, int32_t stream_id, const nghttp2_nv *nva, size_t nvlen);
+		int32_t nghttp2_submit_push_promise(nghttp2_session *session, uint8_t flags, int32_t stream_id, const nghttp2_nv *nva, size_t nvlen, void *promised_stream_user_data);
 		nghttp2_ssize nghttp2_session_mem_send2(nghttp2_session *session, const uint8_t **data_ptr);
 		nghttp2_ssize nghttp2_session_mem_recv2(nghttp2_session *session, const uint8_t *in, size_t inlen);
 		int nghttp2_session_want_read(nghttp2_session *session);
@@ -183,8 +218,11 @@ final class TNgHttp2
 	}
 
 	/**
-	 * Returns the bound FFI instance, loading libnghttp2 on first use.
-	 * @throws THttp2Exception When the library cannot be loaded.
+	 * Returns the bound FFI instance, loading libnghttp2 on first use.  Each candidate library is
+	 * probed for its version first, so a library older than {@see MIN_VERSION} is reported as too old
+	 * rather than as a failure to resolve the newer symbols.
+	 * @throws THttp2Exception `http2_library_too_old` when the only loadable library predates
+	 *   {@see MIN_VERSION}; `http2_library_missing` when no candidate loads.
 	 * @return \FFI The bound nghttp2 FFI instance.
 	 */
 	public static function ffi(): \FFI
@@ -193,15 +231,38 @@ final class TNgHttp2
 			return self::$_ffi;
 		}
 		$errors = [];
+		$tooOld = null;
 		foreach (self::candidateLibraries() as $candidate) {
 			try {
+				$version = self::probeVersion($candidate);
+				if ($version['num'] < self::MIN_VERSION_NUM) {
+					$tooOld ??= [$version['str'], $candidate];
+					$errors[] = $candidate . ' (version ' . $version['str'] . ' is older than ' . self::MIN_VERSION . ')';
+					continue;
+				}
 				self::$_ffi = \FFI::cdef(self::CDEF, $candidate);
 				return self::$_ffi;
 			} catch (\FFI\Exception $e) {
 				$errors[] = $candidate . ' (' . $e->getMessage() . ')';
 			}
 		}
+		if ($tooOld !== null) {
+			throw new THttp2Exception('http2_library_too_old', $tooOld[0], $tooOld[1], self::MIN_VERSION);
+		}
 		throw new THttp2Exception('http2_library_missing', implode('; ', $errors));
+	}
+
+	/**
+	 * Loads a candidate library with the version probe only and returns its version.
+	 * @param string $candidate The library path or soname.
+	 * @throws \FFI\Exception When the candidate does not load.
+	 * @return array{num: int, str: string} nghttp2's `version_num` and `version_str`.
+	 */
+	private static function probeVersion(string $candidate): array
+	{
+		$probe = \FFI::cdef(self::PROBE_CDEF, $candidate);
+		$info = $probe->nghttp2_version(0);
+		return ['num' => $info->version_num, 'str' => \FFI::string($info->version_str)];
 	}
 
 	/**

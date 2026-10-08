@@ -112,4 +112,24 @@ class TNgHttp2Test extends PHPUnit\Framework\TestCase
 		self::assertSame(($major << 16) | ($minor << 8) | $patch, $info->version_num);
 		self::assertSame('h2', \FFI::string($info->proto_str));
 	}
+
+	public function testLoadedLibraryMeetsTheMinimumVersion()
+	{
+		if (!TNgHttp2::isAvailable()) {
+			$this->markTestSkipped('libnghttp2 is not available.');
+		}
+		self::assertSame('1.60.0', TNgHttp2::MIN_VERSION, 'The nghttp2_ssize API arrived in 1.60.0.');
+		self::assertTrue(version_compare(TNgHttp2::version(), TNgHttp2::MIN_VERSION, '>='), 'A loaded library is at least MIN_VERSION.');
+		self::assertSame(5, TNgHttp2::FRAME_PUSH_PROMISE);
+		self::assertSame(-521, TNgHttp2::ERR_TEMPORAL_CALLBACK_FAILURE);
+		self::assertSame(-528, TNgHttp2::ERR_PUSH_DISABLED);
+	}
+
+	public function testTooOldLibraryMessageNamesBothVersions()
+	{
+		$e = new \Prado\IO\Http2\THttp2Exception('http2_library_too_old', '1.59.0', '/usr/lib/libnghttp2.so.14', TNgHttp2::MIN_VERSION);
+		self::assertStringContainsString('1.59.0', $e->getMessage());
+		self::assertStringContainsString('1.60.0', $e->getMessage());
+		self::assertStringContainsString('/usr/lib/libnghttp2.so.14', $e->getMessage());
+	}
 }

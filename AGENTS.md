@@ -43,7 +43,8 @@
 ### Error Handling
 - Throw `Prado\IO\Http2\THttp2Exception` (extends `TIOException`) for HTTP/2 failures, using error codes from `config/errorMessages.txt` (`http2_*`). `errorMessages.txt` is for display text only; code throws the code.
 - `config/errorMessages.txt` is registered system-wide through the `extra.prado.error-messages` entry in composer.json; the framework `messages.txt` is not used.
-- `TNgHttp2::isAvailable()` returns false (rather than throwing) when `libnghttp2` cannot load, so callers can fall back to HTTP/1.1.
+- `TNgHttp2::isAvailable()` returns false (rather than throwing) when `libnghttp2` cannot load or is older than `TNgHttp2::MIN_VERSION` (1.60.0), so callers can fall back to HTTP/1.1; `ffi()` throws `http2_library_too_old` or `http2_library_missing`.
+- Event handlers run inside nghttp2 callbacks, where PHP cannot throw (a fatal error). Every shared callback runs through `guarded()`: a Throwable is held and rethrown by `receive()`/`send()` after nghttp2 returns; the data provider returns `ERR_TEMPORAL_CALLBACK_FAILURE` so only its stream resets. `close()` inside a callback is deferred to `nativeCall()`; never free the nghttp2 session while it executes.
 
 ### Imports
 - PSR-4 autoloading; no manual includes. `use` statements at the top of the file. Extensions do **not** edit the framework `classes.php`.
@@ -75,7 +76,7 @@
 
 ## Development Environment
 - PHP 8.2+; extensions: ffi (required), openssl (h2 over TLS), plus the framework's ctype, dom, intl, json, pcre, spl.
-- System library: `libnghttp2` (bound via FFI).
+- System library: `libnghttp2` 1.60.0 or newer (bound via FFI). CI runs on `ubuntu-26.04` (libnghttp2 1.68.0; 24.04 has 1.59.0) and a workflow step fails when the library does not load, since the tests otherwise skip.
 - `pradosoft/prado ^4.4` is a dev dependency. 4.4 is unreleased, so composer.json resolves it from the sibling `../prado` path repository and CI checks out `pradosoft/prado@master` there (weekly scheduled run included).
 - Composer for dependency management; presume dependencies are installed.
 

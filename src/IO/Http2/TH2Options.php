@@ -4,7 +4,7 @@
  * TH2Options class file.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @link https://github.com/pradosoft/prado-http2
+ * @link https://github.com/belisoful/prado-http2
  * @license https://github.com/pradosoft/prado/blob/master/LICENSE
  */
 

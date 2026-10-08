@@ -4,7 +4,7 @@
  * TH2Session class file.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @link https://github.com/pradosoft/prado-http2
+ * @link https://github.com/belisoful/prado-http2
  * @license https://github.com/pradosoft/prado/blob/master/LICENSE
  */
 
@@ -878,7 +878,7 @@ class TH2Session extends TComponent
 				}
 			}
 		} elseif ($frame->type === TNgHttp2::FRAME_DATA && $endStream) {
-			$this->getStreamsDirect()[$streamId]?->markRemoteClosed();
+			($this->getStreamsDirect()[$streamId] ?? null)?->markRemoteClosed();
 		}
 		return 0;
 	}

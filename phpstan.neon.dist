@@ -1,8 +1,9 @@
 parameters:
     phpVersion:
-        min: 80100 # PHP 8.1, the oldest runtime the package supports
+        min: 80200 # PHP 8.2, the oldest runtime the package supports
         max: 80500 # PHP 8.5, the newest runtime the package supports
-    level: 3
+    level: 4
+    treatPhpDocTypesAsCertain: false
     bootstrapFiles:
         - tests/test_tools/phpstan-bootstrap.php
     paths:

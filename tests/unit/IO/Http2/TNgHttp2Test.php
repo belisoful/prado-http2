@@ -29,8 +29,7 @@ class TNgHttp2Test extends PHPUnit\Framework\TestCase
 
 	public function testStrerrorHandlesNonNegativeCode()
 	{
-		// 0 is NGHTTP2_NO_ERROR ('Success'); strerror returns a PHP string for non-negative codes too.
-		self::assertIsString(TNgHttp2::strerror(0));
+		// 0 is NGHTTP2_NO_ERROR ('Success'); strerror returns a non-empty description for non-negative codes too.
 		self::assertNotSame('', TNgHttp2::strerror(0));
 	}
 

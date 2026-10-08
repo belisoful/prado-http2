@@ -12,7 +12,7 @@ It is the foundation for HTTP/2 servers and clients, and for [RFC 8441](https://
 
 | Requirement | Scope | Purpose |
 |---|---|---|
-| PHP 8.1 to 8.5 | required | CI runs 8.1, 8.2, 8.3, 8.4, and 8.5 |
+| PHP 8.2 to 8.5 | required | CI runs 8.2, 8.3, 8.4, and 8.5 |
 | `ext-ffi` | required | Binds `libnghttp2` at runtime |
 | System `libnghttp2` | suggested | The HTTP/2 framing engine, loaded at runtime (`brew install libnghttp2`, `apt-get install libnghttp2-dev`) |
 | `ext-openssl` | suggested | HTTP/2 over TLS with ALPN `h2`; cleartext `h2c` needs nothing extra |
@@ -23,7 +23,7 @@ It is the foundation for HTTP/2 servers and clients, and for [RFC 8441](https://
 ## Installation
 
 ```sh
-composer require pradosoft/prado-http2
+composer require belisoful/prado-http2
 ```
 
 The library is resolved in this order: an explicit path set with `TNgHttp2::setLibraryPath()`, the `PRADO_NGHTTP2_LIB` environment variable, then platform defaults (Homebrew/`/usr/local` on macOS, the common `libnghttp2.so.14` sonames on Linux, `nghttp2.dll` on Windows). `TNgHttp2::isAvailable()` reports whether it loads, so an application can fall back to HTTP/1.1 when HTTP/2 is unavailable.
@@ -201,10 +201,10 @@ composer install
 composer unittest                                # unit tests (dual in-process sessions)
 composer functest                                # curl --http2-prior-knowledge interop + TLS ALPN
 vendor/bin/php-cs-fixer fix --dry-run            # code style (src/ and tests/)
-vendor/bin/phpstan analyse --memory-limit=512M   # static analysis, level 3, PHP 8.1 to 8.5
+vendor/bin/phpstan analyse --memory-limit=512M   # static analysis, level 4, PHP 8.2 to 8.5
 ```
 
-Unit tests drive a server and a client `TH2Session` against each other in-process (no sockets, no TLS), so they run anywhere `libnghttp2` is installed and skip cleanly where it is not. The functional tests serve a request to the system `curl` over a real socket and complete a TLS handshake that negotiates `h2`. CI runs the whole check on PHP 8.1 through 8.5 against the PRADO `master` branch, on every push and once a week.
+Unit tests drive a server and a client `TH2Session` against each other in-process (no sockets, no TLS), so they run anywhere `libnghttp2` is installed and skip cleanly where it is not. The functional tests serve a request to the system `curl` over a real socket and complete a TLS handshake that negotiates `h2`. CI runs the whole check on PHP 8.2 through 8.5 against the PRADO `master` branch, on every push and once a week.
 
 ## License
 

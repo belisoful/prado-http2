@@ -429,7 +429,7 @@ class TH2SessionTest extends PHPUnit\Framework\TestCase
 		$client->receive($server->send());
 
 		self::assertInstanceOf(TH2Stream::class, $serverStream);
-		self::assertFalse($closed, 'The stream is still open while the provider is deferred.');
+		self::assertFalse($request->eof(), 'The response has not ended while the provider is deferred.');
 
 		$serverStream->markLocalClosed();           // finish an empty body with no preceding write()
 		for ($i = 0; $i < 8 && !$closed; $i++) {

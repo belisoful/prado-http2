@@ -3,7 +3,7 @@
 	"type": "prado4-extension",
 	"description": "HTTP/2 (RFC 9113) for the PRADO PHP framework, implemented over the system libnghttp2 via FFI. Provides general HTTP/2 sessions and streams; the basis for HTTP/2 servers, clients, and RFC 8441 WebSocket multiplexing.",
 	"keywords": [ "prado", "framework", "http2", "h2", "nghttp2", "rfc9113", "rfc8441", "ffi", "extension"],
-	"homepage": "https://github.com/pradosoft/prado-http2",
+	"homepage": "https://github.com/belisoful/prado-http2",
 	"license": "BSD-3-Clause",
 	"authors": [
 		{
@@ -35,7 +35,7 @@
 		}
 	],
 	"require": {
-		"php": ">=8.1.0",
+		"php": ">=8.2.0",
 		"ext-ffi": "*"
 	},
 	"suggest": {
@@ -46,12 +46,12 @@
 		"pradosoft/prado" : "^4.4",
 		"phpunit/phpunit" : "^10",
 		"phpdocumentor/shim": "^3",
-		"friendsofphp/php-cs-fixer": "^3.95",
-		"phpstan/phpstan": "^2.1"
+		"friendsofphp/php-cs-fixer": "3.95.27",
+		"phpstan/phpstan": "2.3.0"
 	},
 	"config": {
 		"platform": {
-			"php": "8.1"
+			"php": "8.2"
 		},
 		"allow-plugins": {
 			"phpdocumentor/shim": true

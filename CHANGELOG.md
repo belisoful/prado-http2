@@ -3,6 +3,20 @@
 All notable changes to `belisoful/prado-http2` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+- PHP 8.2 is the minimum (`"php": ">=8.2.0"`), following PRADO 4.4, which dropped PHP 8.1 (pradosoft/prado#1290). CI covers PHP 8.2 to 8.5 and the Composer platform is 8.2.
+- PHPStan runs at level 4 with `treatPhpDocTypesAsCertain: false`, matching the framework.
+- CI uses `actions/checkout@v7` and `actions/cache@v6`; the dependency cache keys on `composer.json` per PHP version (the lock file is not committed) and the job times out after 30 minutes.
+- Development dependencies pin `friendsofphp/php-cs-fixer` 3.95.27 and `phpstan/phpstan` 2.3.0, the versions PRADO pins.
+
+### Fixed
+- The package `homepage`, the `@link` tag in every class header, and the README install command named `pradosoft/prado-http2`; the package is `belisoful/prado-http2`.
+
+### Upgrading
+- Run on PHP 8.2 or later. PHP 8.1 is no longer supported: PRADO 4.4 does not install on it.
+
 ## [1.1.0] - 2026-09-22
 
 ### Added
@@ -45,6 +59,7 @@ All notable changes to `belisoful/prado-http2` are recorded here. The format fol
 ### Added
 - Initial release: `TNgHttp2` FFI binding over the system `libnghttp2`, `TH2Session` (server and client, memory I/O, shared callbacks), `TH2Stream` (duplex PSR-7 stream), `TH2Options`, `THttp2Exception`, in-process unit tests, and a `curl --http2-prior-knowledge` interoperability test.
 
+[Unreleased]: https://github.com/belisoful/prado-http2/compare/v1.1.0...HEAD
 [1.1.0]: https://github.com/belisoful/prado-http2/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/belisoful/prado-http2/compare/v0.9.0...v1.0.0
 [0.9.0]: https://github.com/belisoful/prado-http2/releases/tag/v0.9.0

@@ -7,7 +7,7 @@
 - **Unit tests**: `composer unittest` (`vendor/bin/phpunit --testsuite unit`) — two in-process nghttp2 sessions, no sockets/TLS.
 - **Functional tests**: `composer functest` (`vendor/bin/phpunit --testsuite functional`) — `curl --http2-prior-knowledge` interop over a real socket.
 - **Test filter**: `vendor/bin/phpunit --testsuite unit --filter <function|class>`.
-- **PHPStan**: `vendor/bin/phpstan analyse --memory-limit=512M` (level 3, PHP 8.1 to 8.5, over `src/` and `tests/`).
+- **PHPStan**: `vendor/bin/phpstan analyse --memory-limit=512M` (level 4, PHP 8.2 to 8.5, over `src/` and `tests/`).
 - **PHP CS Fixer**: `vendor/bin/php-cs-fixer fix --dry-run` (check) / `vendor/bin/php-cs-fixer fix` (apply); covers `src/` and `tests/`.
 - **Install / update deps**: `composer install` / `composer update`.
 - A **full check** is, in order: `php -l` compile → php-cs-fixer → phpstan → phpunit (`unittest`, then `functest` where `libnghttp2` + curl are present). All must pass before a commit.
@@ -16,7 +16,7 @@
 ## Code Style Guidelines
 
 ### PHP Coding Standards
-- PHP 8.1 minimum (CI: 8.1, 8.2, 8.3, 8.4, 8.5). PSR-12 via php-cs-fixer.
+- PHP 8.2 minimum (CI: 8.2, 8.3, 8.4, 8.5), following PRADO 4.4. PSR-12 via php-cs-fixer.
 - Indentation: **1 tab**, never spaces. Line endings: Unix (`\n`). All files begin with `<?php`.
 - `if` always has a `{}` block (no single-line bodies).
 - Use `?` for single nullable types and in doc blocks.
@@ -74,7 +74,7 @@
 - Tests are isolated (no shared state). When testing one class or cluster, run only its tests.
 
 ## Development Environment
-- PHP 8.1+; extensions: ffi (required), openssl (h2 over TLS), plus the framework's ctype, dom, intl, json, pcre, spl.
+- PHP 8.2+; extensions: ffi (required), openssl (h2 over TLS), plus the framework's ctype, dom, intl, json, pcre, spl.
 - System library: `libnghttp2` (bound via FFI).
 - `pradosoft/prado ^4.4` is a dev dependency. 4.4 is unreleased, so composer.json resolves it from the sibling `../prado` path repository and CI checks out `pradosoft/prado@master` there (weekly scheduled run included).
 - Composer for dependency management; presume dependencies are installed.

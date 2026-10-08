@@ -3,7 +3,7 @@
 All notable changes to `belisoful/prado-http2` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.2.1] - 2026-10-07
 
 ### Fixed
 - `TNgHttp2::isAvailable()` and `ffi()` crashed PHP 8.4 and 8.5 (a segmentation fault) when the only libnghttp2 found was older than 1.60.0, such as Ubuntu 24.04's 1.59.0, instead of reporting it as too old. PHP caches a struct field lookup per opline, keyed on the raw type pointer, and never invalidates it; the 1.2.0 version probe created and freed one FFI instance per candidate library, so a later instance's type could reuse a freed address and the stale field descriptor was read (a use-after-free in PHP's FFI extension, which on PHP 8.2 and 8.3 can misread the version silently). Every FFI instance the binding creates is now held for the life of the process, including the binding `setLibraryPath()` replaces, and each candidate is probed once with its result cached.
@@ -84,7 +84,7 @@ All notable changes to `belisoful/prado-http2` are recorded here. The format fol
 ### Added
 - Initial release: `TNgHttp2` FFI binding over the system `libnghttp2`, `TH2Session` (server and client, memory I/O, shared callbacks), `TH2Stream` (duplex PSR-7 stream), `TH2Options`, `THttp2Exception`, in-process unit tests, and a `curl --http2-prior-knowledge` interoperability test.
 
-[Unreleased]: https://github.com/belisoful/prado-http2/compare/v1.2.0...HEAD
+[1.2.1]: https://github.com/belisoful/prado-http2/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/belisoful/prado-http2/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/belisoful/prado-http2/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/belisoful/prado-http2/compare/v0.9.0...v1.0.0

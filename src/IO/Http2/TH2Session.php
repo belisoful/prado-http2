@@ -431,7 +431,7 @@ class TH2Session extends TComponent
 		$onInvalidFrame = static function ($session, $frame, $libError, $userData) use ($ffi) {
 			$self = self::fromUserData($ffi, $userData);
 			$info = self::frameInfo($frame) + ['error' => $libError];
-			return $self === null ? 0 : $self->guarded(fn () => $self->onInvalidFrame($info));
+			return $self === null ? 0 : $self->guarded(fn () => $self->handleInvalidFrame($info));
 		};
 		$onError = static function ($session, $libError, $msg, $len, $userData) use ($ffi) {
 			$self = self::fromUserData($ffi, $userData);
@@ -1089,6 +1089,20 @@ class TH2Session extends TComponent
 			$this->onData($stream);
 		}
 		return 0;
+	}
+
+	/**
+	 * Handles a frame nghttp2 rejected: drops the header block the frame left unfinished (a HEADERS
+	 * rejected mid-block never reaches on_frame_recv), then raises {@see onInvalidFrame}.  nghttp2 1.70
+	 * resets such a stream and reports it here and in on_stream_close; older versions end the
+	 * connection with GOAWAY instead, and {@see close()} drops the block with the session.
+	 * @param array{type: int, streamId: int, flags: int, error: int} $info The frame summary.
+	 */
+	private function handleInvalidFrame(array $info): void
+	{
+		$pending = &$this->getPendingHeadersDirect();
+		unset($pending[$info['streamId']]);
+		$this->onInvalidFrame($info);
 	}
 
 	/**

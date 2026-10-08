@@ -1200,6 +1200,11 @@ class TH2SessionTest extends PHPUnit\Framework\TestCase
 		$client->submitSettings([]);
 		$client->request([':method' => 'GET', ':scheme' => 'http', ':authority' => 'h', ':path' => '/', 'connection' => 'keep-alive']);
 		$this->pump($server, $client, 2);
+		if (!$server->wantsIo()) {
+			// nghttp2 before 1.70 answers the malformed block with GOAWAY (a connection error) instead of
+			// RST_STREAM, so no stream-level callback runs; the block goes with the session.
+			$server->close();
+		}
 		self::assertSame([], $server->pendingHeaderBlocks(), 'No header block lingers for the reset stream.');
 		$server->close();
 		$client->close();

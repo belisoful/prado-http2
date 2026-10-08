@@ -56,6 +56,41 @@ class TNgHttp2Test extends PHPUnit\Framework\TestCase
 		self::assertTrue(TNgHttp2::isAvailable(), 'Null restores default resolution.');
 	}
 
+	public function testRebindingKeepsThePreviousInstanceAlive()
+	{
+		// PHP caches struct field lookups per opline, keyed on the raw type pointer, and never
+		// invalidates them.  A freed FFI instance lets a later instance reuse the address, and the
+		// stale field descriptor is then read (a use-after-free).  No instance may ever be freed.
+		$first = TNgHttp2::ffi();
+		$weak = \WeakReference::create($first);
+		unset($first);
+		try {
+			TNgHttp2::setLibraryPath('/nonexistent/libnghttp2.dylib');
+			self::assertFalse(TNgHttp2::isAvailable());
+			gc_collect_cycles();
+			self::assertNotNull($weak->get(), 'The binding replaced by setLibraryPath() stays allocated.');
+		} finally {
+			TNgHttp2::setLibraryPath(null);
+		}
+		self::assertSame($weak->get(), TNgHttp2::ffi(), 'Resolving the same library again reuses its binding.');
+	}
+
+	public function testUnavailableLibraryIsReportedRepeatedly()
+	{
+		// Each isAvailable() call after a failure resolves again; the probe results are cached per
+		// candidate, so the loop must neither crash nor change its answer.
+		try {
+			TNgHttp2::setLibraryPath('/nonexistent/libnghttp2.dylib');
+			for ($i = 0; $i < 20; $i++) {
+				self::assertFalse(TNgHttp2::isAvailable(), "Call $i reports the library unavailable.");
+			}
+		} finally {
+			TNgHttp2::setLibraryPath(null);
+		}
+		self::assertTrue(TNgHttp2::isAvailable(), 'Default resolution still loads the library.');
+		self::assertSame(TNgHttp2::version(), TNgHttp2::version(), 'The version reads back stably.');
+	}
+
 	public function testDualSessionSettingsExchangeWithConnectProtocol()
 	{
 		$ffi = TNgHttp2::ffi();

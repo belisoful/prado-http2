@@ -200,6 +200,18 @@ final class TNgHttp2
 	/** @var ?\FFI The bound FFI instance, created on first use. */
 	private static ?\FFI $_ffi = null;
 
+	/**
+	 * @var array<string, \FFI> The version probe of each candidate library, by candidate, held for
+	 *   the life of the process.  PHP caches a struct field lookup per opline, keyed on the raw type
+	 *   pointer, and never invalidates the cache.  Freeing an instance whose struct fields were read
+	 *   lets a later instance's type reuse the address, and the stale field descriptor is then used:
+	 *   a use-after-free that misreads the field or crashes.  No instance this class creates is freed.
+	 */
+	private static array $_probes = [];
+
+	/** @var array<string, \FFI> The full binding of each library bound so far, by candidate (see `$_probes`). */
+	private static array $_bindings = [];
+
 	/** @var ?string An explicit library path overriding the platform defaults. */
 	private static ?string $_libraryPath = null;
 
@@ -208,7 +220,8 @@ final class TNgHttp2
 	// =========================================================================
 
 	/**
-	 * Sets an explicit libnghttp2 path, overriding the environment and platform defaults.
+	 * Sets an explicit libnghttp2 path, overriding the environment and platform defaults.  The next
+	 * {@see ffi()} call resolves again; a library bound before is reused, and no binding is freed.
 	 * @param ?string $value The library path, or null to restore default resolution.
 	 */
 	public static function setLibraryPath(?string $value): void
@@ -240,7 +253,7 @@ final class TNgHttp2
 					$errors[] = $candidate . ' (version ' . $version['str'] . ' is older than ' . self::MIN_VERSION . ')';
 					continue;
 				}
-				self::$_ffi = \FFI::cdef(self::CDEF, $candidate);
+				self::$_ffi = self::$_bindings[$candidate] ??= \FFI::cdef(self::CDEF, $candidate);
 				return self::$_ffi;
 			} catch (\FFI\Exception $e) {
 				$errors[] = $candidate . ' (' . $e->getMessage() . ')';
@@ -253,14 +266,16 @@ final class TNgHttp2
 	}
 
 	/**
-	 * Loads a candidate library with the version probe only and returns its version.
+	 * Loads a candidate library with the version probe only and returns its version.  The probe
+	 * instance of a candidate is created once per process and kept (see `$_probes`), so repeated
+	 * resolution of a too-old library creates no further instances.
 	 * @param string $candidate The library path or soname.
 	 * @throws \FFI\Exception When the candidate does not load.
 	 * @return array{num: int, str: string} nghttp2's `version_num` and `version_str`.
 	 */
 	private static function probeVersion(string $candidate): array
 	{
-		$probe = \FFI::cdef(self::PROBE_CDEF, $candidate);
+		$probe = self::$_probes[$candidate] ??= \FFI::cdef(self::PROBE_CDEF, $candidate);
 		$info = $probe->nghttp2_version(0);
 		return ['num' => $info->version_num, 'str' => \FFI::string($info->version_str)];
 	}

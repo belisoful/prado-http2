@@ -3,7 +3,7 @@
 All notable changes to `belisoful/prado-http2` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.2.0] - 2026-10-07
 
 ### Added
 - `TNgHttp2::MIN_VERSION` (`1.60.0`, where nghttp2's `nghttp2_ssize` API arrived). Each candidate library is probed for its version before the full declaration is bound; an older one is reported through the new error code `http2_library_too_old` (version found, path, version required) instead of a symbol-resolution failure.
@@ -79,7 +79,7 @@ All notable changes to `belisoful/prado-http2` are recorded here. The format fol
 ### Added
 - Initial release: `TNgHttp2` FFI binding over the system `libnghttp2`, `TH2Session` (server and client, memory I/O, shared callbacks), `TH2Stream` (duplex PSR-7 stream), `TH2Options`, `THttp2Exception`, in-process unit tests, and a `curl --http2-prior-knowledge` interoperability test.
 
-[Unreleased]: https://github.com/belisoful/prado-http2/compare/v1.1.0...HEAD
+[1.2.0]: https://github.com/belisoful/prado-http2/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/belisoful/prado-http2/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/belisoful/prado-http2/compare/v0.9.0...v1.0.0
 [0.9.0]: https://github.com/belisoful/prado-http2/releases/tag/v0.9.0

@@ -37,7 +37,7 @@
 ### Documentation Standards
 - Every public method has a PHPDoc block with `@param`/`@return`/`@throws` as applicable, plus at least one descriptive sentence.
 - Classes have a clear top docblock (what/why/how, an example where useful) with `@author` and `@since`.
-- `@since` uses the current version (`1.1.0`).
+- `@since` uses the current version (`1.2.0`).
 - Docblocks are technical, present tense, American English. Banned: antithesis ("not X, it Ys"), em-dash dramatic asides, editorializing/filler, rule-of-three lists. One fact per sentence; prefer subject-verb-object and `condition → result`.
 
 ### Error Handling

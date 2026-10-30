@@ -83,8 +83,7 @@
 # PRADO Framework Agent Safeguards — ANTI-PATTERNS
 
 Required without exception:
-- NEVER execute these `git` commands without asking the developer first: clone, checkout, mv, restore, rm, branch, add, commit, merge, rebase, reset, pull, push, fetch.
-- NEVER execute `rm` on any path without asking the developer first.
+- **Never** run `rm` on any path without developer approval first; the only exception is cleanup of the temporary work of a session, like removing scratchpads, worktrees, test folders/files, etc.
 - NEVER remove `composer --dev` dependencies; they are required for development.
 - NEVER erase or overwrite files for the task of unit testing and fixing; the file changes are what is being tested.
 - NEVER delete folders or files until the associated task is absolutely complete.

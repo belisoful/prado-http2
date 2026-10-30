@@ -131,7 +131,6 @@ Prefer subject-verb-object declaratives and `condition → result` lists.
 
 ## Anti-Patterns (Required Safeguards)
 
-- **Never** run `git clone/checkout/mv/restore/rm/branch/add/commit/merge/rebase/reset/pull/push/fetch` without developer approval first.
-- **Never** run `rm` on any path without developer approval first.
+- **Never** run `rm` on any path without developer approval first; the only exception is cleanup of the temporary work of a session, like removing scratchpads, worktrees, test folders/files, etc.
 - **Never** remove `composer --dev` dependencies.
 - **Never** erase or overwrite files during unit testing — the file changes being tested must be preserved.

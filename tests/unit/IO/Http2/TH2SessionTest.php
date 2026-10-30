@@ -1763,6 +1763,33 @@ class TH2SessionTest extends PHPUnit\Framework\TestCase
 		$transport->close();
 	}
 
+	public function testPumpClosesTheSessionWhenTheTransportReadFails()
+	{
+		$this->requirePump();
+		[$serverSocket, $clientSocket] = TSocketStream::pair();
+		// A peer reset makes fread() fail on Linux; this stream fails every read the same way.
+		$failing = new class ($serverSocket->detach()) extends TSocketStream {
+			public function read(int $length): string
+			{
+				throw new \RuntimeException('Unable to read from stream');
+			}
+		};
+		$transport = new TAsyncStream($failing);
+		$server = new TH2Session(true);
+		$server->submitSettings([]);
+		$pump = TAsync::run(fn () => $server->pump($transport, new TCancellationToken(10.0)));
+		$clientSocket->write('x');                             // the transport turns readable
+		$pump->await();
+		try {
+			$server->ping();
+			self::fail('The session was not closed after the failed read.');
+		} catch (THttp2Exception $e) {
+			self::assertSame('http2_session_closed', $e->getErrorCode());
+		}
+		$clientSocket->close();
+		$transport->close();
+	}
+
 	public function testPumpEndsWithTheCancelledTokenAndLeavesTheSessionOpen()
 	{
 		$this->requirePump();

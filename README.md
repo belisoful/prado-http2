@@ -148,6 +148,23 @@ Event handlers run inside nghttp2 callbacks, where PHP cannot throw. A Throwable
 
 Tuning is passed at creation: `new TH2Session(true, (new TH2Options())->setPeerMaxConcurrentStreams(100))`. Diagnostic events `onFrameSent`/`onFrameNotSent`/`onInvalidFrame`/`onSessionError` surface frame activity and protocol errors.
 
+### Event loops and fibers
+
+A handler runs inside an nghttp2 callback, so the session is busy until the `receive()` or `send()` that raised it returns. `receive()` throws `http2_session_busy` while any nghttp2 call on the session is in progress, and `send()` throws it while another `send()` is in progress (a `send()` from inside a `receive()` handler is allowed): a nested call would re-enter nghttp2's state machine. This covers PRADO 4.4's fibers (`Prado\IO\Async`). PHP permits a fiber switch inside an FFI callback, so a handler that waits on the event loop (`TAsync::sleep()`, `TFuture::await()`, a `TAsyncStream` read) leaves nghttp2 mid-call while the loop runs, from the main fiber or from a suspended worker fiber, and the loop's next `receive()` on the session is such a re-entry. A handler that needs to wait hands the work to `TAsync::run()` and returns; the fiber resumes from the loop outside any nghttp2 call and may then respond, write, and end the stream. The next `send()` carries what it produced.
+
+```php
+use Prado\IO\Async\TAsync;
+
+$session->attachEventHandler('onRequest', function ($session, $stream) use ($backend) {
+    TAsync::run(function () use ($session, $stream, $backend) {
+        $body = $backend->fetch($stream->getHeader(':path'));   // waits on the loop
+        $session->respond($stream, [':status' => '200']);
+        $stream->write($body);
+        $stream->markLocalClosed();
+    });
+});
+```
+
 ### `TNgHttp2` directly
 
 `TNgHttp2::ffi()` returns the bound `\FFI` instance for code that needs the raw nghttp2 API. Constants cover the SETTINGS ids (`SETTINGS_*`), frame types (`FRAME_*`), HTTP/2 error codes (`NO_ERROR`, `CANCEL`, `REFUSED_STREAM`, `INTERNAL_ERROR`, `PROTOCOL_ERROR`, `STREAM_CLOSED`), the `FLAG_END_STREAM`/`DATA_FLAG_*` flags, and `ERR_DEFERRED`. `TNgHttp2::version()` returns the loaded library version; `TNgHttp2::strerror($code)` describes an nghttp2 error.

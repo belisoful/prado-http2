@@ -1,5 +1,6 @@
 <?php
 
+use Prado\IO\Async\TAsync;
 use Prado\IO\Http2\TH2Session;
 use Prado\IO\Http2\TH2Stream;
 use Prado\IO\Http2\THttp2Exception;
@@ -1292,5 +1293,191 @@ class TH2SessionTest extends PHPUnit\Framework\TestCase
 			$out .= \FFI::string($pointer, $n);
 		}
 		return $out;
+	}
+
+	// =========================================================================
+	// Re-entry: a busy session, and handlers under fibers
+	// =========================================================================
+
+	/** An empty SETTINGS frame: nine header bytes, type 4, no flags, stream 0. */
+	private const EMPTY_SETTINGS_FRAME = "\0\0\0\x04\0\0\0\0\0";
+
+	public function testReceiveInsideAHandlerThrowsSessionBusy()
+	{
+		$server = new TH2Session(true);
+		$client = new TH2Session(false);
+		$server->submitSettings([]);
+		$client->submitSettings([]);
+		$server->attachEventHandler('onRequest', function ($session, $stream) use ($server) {
+			$server->receive(self::EMPTY_SETTINGS_FRAME);   // nghttp2 is mid-call: a nested mem_recv
+		});
+		$status = null;
+		$client->attachEventHandler('onResponse', function ($session, $stream) use (&$status) {
+			$status = $stream->getHeader(':status');
+		});
+		$clientStream = $client->request([':method' => 'GET', ':scheme' => 'http', ':authority' => 'example.com', ':path' => '/']);
+		$clientStream->markLocalClosed();
+
+		try {
+			$server->receive($client->send());
+			self::fail('receive() inside a handler must throw http2_session_busy.');
+		} catch (THttp2Exception $e) {
+			self::assertSame('http2_session_busy', $e->getErrorCode());
+		}
+
+		// The frames of the outer call were still processed and the session stays usable.
+		$serverStream = $server->getStream($clientStream->getStreamId());
+		self::assertNotNull($serverStream, 'The request stream opened despite the handler failure.');
+		$server->respond($serverStream, [':status' => '204']);
+		$serverStream->markLocalClosed();
+		$client->receive($server->send());
+		self::assertSame('204', $status);
+	}
+
+	public function testSendInsideASendHandlerThrowsSessionBusy()
+	{
+		$server = new TH2Session(true);
+		$client = new TH2Session(false);
+		$server->submitSettings([TNgHttp2::SETTINGS_ENABLE_CONNECT_PROTOCOL => 1]);
+		$client->submitSettings([]);
+		$nested = 0;
+		$server->attachEventHandler('onFrameSent', function ($session, $info) use ($server, &$nested) {
+			$nested++;
+			$server->send();                                   // nghttp2 is producing output: a nested mem_send
+		});
+
+		try {
+			$server->send();
+			self::fail('send() inside a send handler must throw http2_session_busy.');
+		} catch (THttp2Exception $e) {
+			self::assertSame('http2_session_busy', $e->getErrorCode());
+		}
+		self::assertGreaterThan(0, $nested, 'The handler ran for the SETTINGS frame.');
+
+		// The bytes the throwing send() produced come out of the next send(), so the peer misses nothing.
+		$server->detachEventHandler('onFrameSent', null);
+		$client->receive($server->send());
+		self::assertSame(1, $client->getRemoteSetting(TNgHttp2::SETTINGS_ENABLE_CONNECT_PROTOCOL));
+	}
+
+	public function testSendInsideAReceiveHandlerIsAllowed()
+	{
+		$server = new TH2Session(true);
+		$client = new TH2Session(false);
+		$server->submitSettings([]);
+		$client->submitSettings([]);
+		$inner = null;
+		$server->attachEventHandler('onRequest', function ($session, $stream) use ($server, &$inner) {
+			$server->respond($stream, [':status' => '204']);
+			$stream->markLocalClosed();
+			$inner = $server->send();                          // nested inside mem_recv: allowed
+		});
+		$status = null;
+		$client->attachEventHandler('onResponse', function ($session, $stream) use (&$status) {
+			$status = $stream->getHeader(':status');
+		});
+		$clientStream = $client->request([':method' => 'GET', ':scheme' => 'http', ':authority' => 'example.com', ':path' => '/']);
+		$clientStream->markLocalClosed();
+
+		$server->receive($client->send());
+		self::assertIsString($inner);
+		self::assertContains(TNgHttp2::FRAME_HEADERS, $this->frameTypes($inner), 'The nested send() carried the response.');
+		$client->receive($inner . $server->send());
+		self::assertSame('204', $status);
+	}
+
+	public function testReceiveWhileAHandlerIsSuspendedInAFiberThrowsSessionBusy()
+	{
+		$server = new TH2Session(true);
+		$client = new TH2Session(false);
+		$server->submitSettings([]);
+		$client->submitSettings([]);
+		$resumed = false;
+		$server->attachEventHandler('onRequest', function ($session, $stream) use ($server, &$resumed) {
+			\Fiber::suspend();                                 // the handler waits; nghttp2 stays mid-call on this fiber
+			$resumed = true;
+			$server->respond($stream, [':status' => '200']);
+			$stream->write('after resume');
+			$stream->markLocalClosed();
+		});
+		$status = null;
+		$body = '';
+		$client->attachEventHandler('onResponse', function ($session, $stream) use (&$status) {
+			$status = $stream->getHeader(':status');
+		});
+		$client->attachEventHandler('onData', function ($session, $stream) use (&$body) {
+			$body .= $stream->getContents();
+		});
+		$clientStream = $client->request([':method' => 'GET', ':scheme' => 'http', ':authority' => 'example.com', ':path' => '/']);
+		$clientStream->markLocalClosed();
+		$request = $client->send();
+
+		$fiber = new \Fiber(function () use ($server, $request) {
+			$server->receive($request);
+		});
+		$fiber->start();
+		self::assertTrue($fiber->isSuspended(), 'PHP switches fibers inside an FFI callback.');
+
+		// The event loop (or any other fiber) reaching the session meanwhile is refused.
+		try {
+			$server->receive(self::EMPTY_SETTINGS_FRAME);
+			self::fail('receive() while a handler is suspended must throw http2_session_busy.');
+		} catch (THttp2Exception $e) {
+			self::assertSame('http2_session_busy', $e->getErrorCode());
+		}
+		$client->receive($server->send());                     // a send() meanwhile is allowed: the server SETTINGS reach the client
+		self::assertFalse($fiber->isTerminated(), 'The handler has not resumed.');
+		self::assertNull($status);
+
+		$fiber->resume();
+		self::assertTrue($fiber->isTerminated());
+		self::assertTrue($resumed);
+		$client->receive($server->send());
+		self::assertSame('200', $status);
+		self::assertSame('after resume', $body);
+	}
+
+	public function testAHandlerHandsWaitingWorkToAFiber()
+	{
+		if (!class_exists(TAsync::class)) {
+			$this->markTestSkipped('The PRADO async API (Prado\\IO\\Async\\TAsync) is not available.');
+		}
+		$server = new TH2Session(true);
+		$client = new TH2Session(false);
+		$server->submitSettings([]);
+		$client->submitSettings([]);
+		$future = null;
+		$server->attachEventHandler('onRequest', function ($session, $stream) use ($server, &$future) {
+			// The fiber runs until its first wait, then the handler returns; the loop resumes the
+			// fiber outside any nghttp2 call, where it responds and ends the stream.
+			$future = TAsync::run(function () use ($server, $stream) {
+				TAsync::sleep(0.01);
+				$server->respond($stream, [':status' => '200']);
+				$stream->write('late');
+				$stream->markLocalClosed();
+				return 'done';
+			});
+		});
+		$status = null;
+		$body = '';
+		$client->attachEventHandler('onResponse', function ($session, $stream) use (&$status) {
+			$status = $stream->getHeader(':status');
+		});
+		$client->attachEventHandler('onData', function ($session, $stream) use (&$body) {
+			$body .= $stream->getContents();
+		});
+		$clientStream = $client->request([':method' => 'GET', ':scheme' => 'http', ':authority' => 'example.com', ':path' => '/']);
+		$clientStream->markLocalClosed();
+
+		$server->receive($client->send());
+		self::assertNotNull($future);
+		self::assertFalse($future->isComplete(), 'The handler returned while the fiber waits.');
+		$client->receive($server->send());                     // SETTINGS only: no response yet
+		self::assertNull($status);
+
+		self::assertSame('done', $future->await());            // the main fiber runs the loop until the timer fires
+		$client->receive($server->send());
+		self::assertSame('200', $status);
+		self::assertSame('late', $body);
 	}
 }

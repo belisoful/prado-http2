@@ -3,6 +3,14 @@
 All notable changes to `belisoful/prado-http2` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- Error code `http2_session_busy`: `receive()` throws it while any nghttp2 call on the session is in progress, and `send()` throws it while another `send()` is in progress (a `send()` from inside a `receive()` handler stays allowed). A nested `receive()` re-entered nghttp2's inbound state machine with a frame half processed, and a nested `send()` reported the frame in progress twice. PHP permits a fiber switch inside an FFI callback, so with PRADO 4.4's fibers on the event loop (`Prado\IO\Async`) a handler that waited on the loop (`TAsync::sleep()`, `TFuture::await()`) left nghttp2 mid-call while the loop ran, and the loop's next `receive()` on the session was such a re-entry. A handler that waits hands the work to `TAsync::run()` and returns (README, "Event loops and fibers").
+
+### Changed
+- Validated against PRADO 4.4 master with fibers on the event loop: the extension uses none of the changed API. The framework now requires `revolt/event-loop`, which arrives through `pradosoft/prado`; a unit test drives the `TAsync::run()` hand-off on the default loop and skips when the async API is absent.
+
 ## [1.2.1] - 2026-10-07
 
 ### Fixed

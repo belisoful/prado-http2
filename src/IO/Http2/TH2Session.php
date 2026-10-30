@@ -44,6 +44,16 @@ use Prado\TComponent;
  * A failure inside the data provider resets only its stream.  A {@see close()} from inside a
  * handler takes effect at once for the PHP side and frees the nghttp2 session once the call returns.
  *
+ * The session is busy while nghttp2 executes a call on it.  {@see receive()} throws
+ * `http2_session_busy` while any nghttp2 call on the session is in progress, and {@see send()}
+ * throws it while another send() is in progress: a nested call would re-enter nghttp2's state
+ * machine.  PHP permits a fiber switch inside an FFI callback, so a handler that waits on the
+ * PRADO event loop (`TAsync::sleep()`, `TFuture::await()`, a `TAsyncStream` read) leaves nghttp2
+ * mid-call while the loop runs, from the main fiber or from a suspended worker fiber, and the
+ * loop's next receive() on the session is such a re-entry.  A handler that waits hands the work
+ * to {@see \Prado\IO\Async\TAsync::run()} and returns; the fiber resumes from the loop outside
+ * any nghttp2 call and may then respond, write, and end the stream.
+ *
  * The nghttp2 callbacks are built once and shared by every session: PHP closures handed to FFI
  * are retained for the FFI instance's life, so per-session closures would leak.  The shared
  * callbacks route to the owning session through nghttp2's `user_data`, a per-session id held in
@@ -125,6 +135,9 @@ class TH2Session extends TComponent
 
 	/** @var int The nesting depth of nghttp2 calls in progress that may run callbacks. */
 	private int $_nativeDepth = 0;
+
+	/** @var bool Whether a send() is draining nghttp2's output. */
+	private bool $_sending = false;
 
 	/** @var bool Whether close() ran inside a callback and the nghttp2 session waits to be freed. */
 	private bool $_closePending = false;
@@ -304,6 +317,18 @@ class TH2Session extends TComponent
 	protected function setNativeDepthDirect(int $value): void
 	{
 		$this->_nativeDepth = $value;
+	}
+
+	/** @return bool Whether a send() is draining nghttp2's output. */
+	protected function getSendingDirect(): bool
+	{
+		return $this->_sending;
+	}
+
+	/** @param bool $value Whether a send() is draining nghttp2's output. */
+	protected function setSendingDirect(bool $value): void
+	{
+		$this->_sending = $value;
 	}
 
 	/** @return bool Whether the nghttp2 session waits to be freed after the current call. */
@@ -706,14 +731,22 @@ class TH2Session extends TComponent
 
 	/**
 	 * Feeds received transport bytes into the session, driving its callbacks and event handlers.
+	 * The session must be idle: a call from inside a handler, or from the event loop or another
+	 * fiber while a handler is suspended inside a callback, throws `http2_session_busy`.
 	 * @param string $bytes The bytes read from the transport.
-	 * @throws THttp2Exception When nghttp2 rejects the input.
+	 * @throws THttp2Exception When nghttp2 rejects the input, or `http2_session_busy` when an nghttp2
+	 *   call on this session is in progress.
 	 * @throws \Throwable The first Throwable an event handler raised while the bytes were processed;
 	 *   the remaining frames were still processed and the session stays usable.
 	 */
 	public function receive(string $bytes): void
 	{
 		$this->assertOpen();
+		if ($this->getNativeDepthDirect() > 0) {
+			// nghttp2 is executing this session (a handler runs, or a fiber is suspended inside one):
+			// a nested mem_recv would re-enter the inbound state machine with a frame half processed.
+			throw new THttp2Exception('http2_session_busy', 'receive');
+		}
 		$length = strlen($bytes);
 		if ($length === 0) {
 			return;
@@ -734,8 +767,11 @@ class TH2Session extends TComponent
 	 * Drains and returns all bytes the session has to send to the transport.  Stops early when a
 	 * handler closed the session while the bytes were produced.  When a handler or the data provider
 	 * threw, the bytes produced in this call are kept and returned first by the next send(), so the
-	 * peer misses nothing.
-	 * @throws THttp2Exception When nghttp2 fails to produce output.
+	 * peer misses nothing.  A send() from inside a {@see receive()} handler is allowed; one from
+	 * inside a send() handler (`onFrameSent`), or from the event loop or another fiber while such a
+	 * handler is suspended, throws `http2_session_busy`.
+	 * @throws THttp2Exception When nghttp2 fails to produce output, or `http2_session_busy` when
+	 *   another send() on this session is in progress.
 	 * @throws \Throwable The first Throwable an event handler or data provider raised while the
 	 *   bytes were produced; the session stays usable.
 	 * @return string The bytes to write to the transport ('' when none).
@@ -743,20 +779,30 @@ class TH2Session extends TComponent
 	public function send(): string
 	{
 		$this->assertOpen();
+		if ($this->getSendingDirect()) {
+			// nghttp2 is producing this session's output (an onFrameSent handler runs, or a fiber is
+			// suspended inside one): a nested mem_send would report the frame in progress twice.
+			throw new THttp2Exception('http2_session_busy', 'send');
+		}
 		$ffi = $this->getFfiDirect();
 		$session = $this->getSessionDirect();
 		$output = $this->getUnsentOutputDirect();
 		$this->setUnsentOutputDirect('');
-		while (!$this->getClosedDirect()) {
-			$pointer = $ffi->new('uint8_t*');
-			$count = $this->nativeCall(fn () => $ffi->nghttp2_session_mem_send2($session, \FFI::addr($pointer)));
-			if ($count < 0) {
-				throw new THttp2Exception('http2_session_send_failed', TNgHttp2::strerror($count));
+		$this->setSendingDirect(true);
+		try {
+			while (!$this->getClosedDirect()) {
+				$pointer = $ffi->new('uint8_t*');
+				$count = $this->nativeCall(fn () => $ffi->nghttp2_session_mem_send2($session, \FFI::addr($pointer)));
+				if ($count < 0) {
+					throw new THttp2Exception('http2_session_send_failed', TNgHttp2::strerror($count));
+				}
+				if ($count === 0) {
+					break;
+				}
+				$output .= \FFI::string($pointer, $count);
 			}
-			if ($count === 0) {
-				break;
-			}
-			$output .= \FFI::string($pointer, $count);
+		} finally {
+			$this->setSendingDirect(false);
 		}
 		if ($this->getPendingThrowableDirect() !== null && $this->getNativeDepthDirect() === 0) {
 			$this->setUnsentOutputDirect($output);

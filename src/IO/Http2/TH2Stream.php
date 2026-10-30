@@ -44,6 +44,14 @@ use Revolt\EventLoop\Suspension;
  * loop.  A worker fiber started with `TAsync::run()` from an `onRequest` handler consumes a
  * request body this way as it arrives.
  *
+ * {@see writeAsync()} is the fiber-aware write with backpressure: it queues the bytes and
+ * suspends the fiber while more than the {@see getWriteHighWaterMark() high-water mark} is
+ * queued, until the data provider drains the queue into DATA frames.  The mark defaults to the
+ * peer's remaining flow-control window for the stream, so the queue tracks what the peer can
+ * accept.  {@see awaitResponse()} suspends a client fiber until the final response headers
+ * arrive (a `:status` other than 1xx).  One fiber waits per condition; a second concurrent wait
+ * of the same kind throws.
+ *
  * State is self-encapsulated: every field is reached through a protected `get*Direct()`/
  * `set*Direct()` accessor (the byte buffers return by reference), so a subclass can intercept
  * any of it.  Each buffer is consumed from the front through an offset (`IncomingOffset`,
@@ -56,6 +64,15 @@ use Revolt\EventLoop\Suspension;
  */
 class TH2Stream extends TComponent implements StreamInterface
 {
+	/** @var string The wait kind of {@see waitReadable()}: incoming bytes or end of stream. */
+	public const WAIT_READ = 'read';
+
+	/** @var string The wait kind of {@see waitWritable()}: the outgoing queue at or below the high-water mark. */
+	public const WAIT_WRITE = 'write';
+
+	/** @var string The wait kind of {@see awaitResponse()}: the final response headers. */
+	public const WAIT_RESPONSE = 'response';
+
 	/** @var int The consumed prefix length at which a buffer is compacted (once it is at least half consumed). */
 	private const COMPACT_THRESHOLD = 1048576;
 
@@ -98,8 +115,11 @@ class TH2Stream extends TComponent implements StreamInterface
 	/** @var int The total number of bytes read, for {@see tell()}. */
 	private int $_readPosition = 0;
 
-	/** @var ?Suspension The fiber suspended in {@see waitReadable()}, awaiting bytes or end of stream. */
-	private ?Suspension $_waiter = null;
+	/** @var array<string, Suspension> The suspended fibers by wait kind ({@see WAIT_READ}, {@see WAIT_WRITE}, {@see WAIT_RESPONSE}). */
+	private array $_waiters = [];
+
+	/** @var ?int The queued outgoing byte count above which {@see writeAsync()} waits, or null for the peer's window. */
+	private ?int $_writeHighWaterMark = null;
 
 	/**
 	 * @param TH2Session $session The owning session.
@@ -343,23 +363,49 @@ class TH2Stream extends TComponent implements StreamInterface
 	}
 
 	/**
-	 * Returns the raw suspension of the fiber waiting for incoming bytes.
+	 * Returns the raw suspension of the fiber waiting for a condition.
+	 * @param string $kind The wait kind: {@see WAIT_READ}, {@see WAIT_WRITE}, or {@see WAIT_RESPONSE}.
 	 * @return ?Suspension The waiting fiber's suspension, or null when no fiber waits.
 	 * @since 1.2.1
 	 */
-	protected function getWaiterDirect(): ?Suspension
+	protected function getWaiterDirect(string $kind = self::WAIT_READ): ?Suspension
 	{
-		return $this->_waiter;
+		return $this->_waiters[$kind] ?? null;
 	}
 
 	/**
-	 * Sets the raw suspension of the fiber waiting for incoming bytes.
+	 * Sets the raw suspension of the fiber waiting for a condition.
 	 * @param ?Suspension $value The waiting fiber's suspension, or null when no fiber waits.
+	 * @param string $kind The wait kind: {@see WAIT_READ}, {@see WAIT_WRITE}, or {@see WAIT_RESPONSE}.
 	 * @since 1.2.1
 	 */
-	protected function setWaiterDirect(?Suspension $value): void
+	protected function setWaiterDirect(?Suspension $value, string $kind = self::WAIT_READ): void
 	{
-		$this->_waiter = $value;
+		if ($value === null) {
+			unset($this->_waiters[$kind]);
+		} else {
+			$this->_waiters[$kind] = $value;
+		}
+	}
+
+	/**
+	 * Returns the raw write high-water mark.
+	 * @return ?int The mark in bytes, or null for the peer's window.
+	 * @since 1.2.1
+	 */
+	protected function getWriteHighWaterMarkDirect(): ?int
+	{
+		return $this->_writeHighWaterMark;
+	}
+
+	/**
+	 * Sets the raw write high-water mark.
+	 * @param ?int $value The mark in bytes, or null for the peer's window.
+	 * @since 1.2.1
+	 */
+	protected function setWriteHighWaterMarkDirect(?int $value): void
+	{
+		$this->_writeHighWaterMark = $value;
 	}
 
 	// =========================================================================
@@ -388,6 +434,52 @@ class TH2Stream extends TComponent implements StreamInterface
 		return $this->getHeadersDirect()[$name] ?? null;
 	}
 
+	/**
+	 * Indicates whether the final response headers are present: a `:status` other than 1xx.  A
+	 * client stream gains them when the server's final response arrives; a server stream never has
+	 * them.
+	 * @return bool Whether a final response `:status` is present.
+	 * @since 1.2.1
+	 */
+	public function hasFinalResponse(): bool
+	{
+		$status = $this->getHeader(':status');
+		return $status !== null && $status !== '' && $status[0] !== '1';
+	}
+
+	/**
+	 * Returns the queued outgoing byte count above which {@see writeAsync()} waits.  Null means the
+	 * peer's remaining flow-control window for the stream
+	 * ({@see TH2Session::getStreamRemoteWindowSize()}), so the queue holds what the peer can accept.
+	 * @return ?int The mark in bytes, or null for the peer's window.
+	 * @since 1.2.1
+	 */
+	public function getWriteHighWaterMark(): ?int
+	{
+		return $this->getWriteHighWaterMarkDirect();
+	}
+
+	/**
+	 * Sets the queued outgoing byte count above which {@see writeAsync()} waits.  A negative value
+	 * is treated as zero.
+	 * @param ?int $value The mark in bytes, or null for the peer's window.
+	 * @since 1.2.1
+	 */
+	public function setWriteHighWaterMark(?int $value): void
+	{
+		$this->setWriteHighWaterMarkDirect($value === null ? null : max(0, $value));
+	}
+
+	/**
+	 * Returns the number of outgoing bytes queued and not yet drained into DATA frames.
+	 * @return int The queued byte count.
+	 * @since 1.2.1
+	 */
+	public function getOutgoingLength(): int
+	{
+		return strlen($this->getOutgoingDirect()) - $this->getOutgoingOffsetDirect();
+	}
+
 	// =========================================================================
 	// Session Plumbing
 	// =========================================================================
@@ -405,12 +497,13 @@ class TH2Stream extends TComponent implements StreamInterface
 		$incoming = &$this->getIncomingDirect();
 		$incoming .= $bytes;
 		if ($bytes !== '') {
-			$this->wakeWaiter();
+			$this->wakeWaiter(self::WAIT_READ);
 		}
 	}
 
 	/**
-	 * Removes and returns up to $length queued outgoing bytes (called by the data provider).
+	 * Removes and returns up to $length queued outgoing bytes (called by the data provider) and
+	 * wakes a fiber waiting in {@see writeAsync()}, which re-checks the queue against the mark.
 	 * @param int $length The maximum bytes to take.
 	 * @return string The dequeued bytes ('' when none are queued).
 	 */
@@ -423,6 +516,7 @@ class TH2Stream extends TComponent implements StreamInterface
 		$offset = $this->getOutgoingOffsetDirect();
 		$bytes = substr($outgoing, $offset, $length);
 		$this->setOutgoingOffsetDirect(self::advance($outgoing, $offset + strlen($bytes)));
+		$this->wakeWaiter(self::WAIT_WRITE);
 		return $bytes;
 	}
 
@@ -465,11 +559,15 @@ class TH2Stream extends TComponent implements StreamInterface
 		return $this->getLocalClosedDirect();
 	}
 
-	/** Marks the peer as half-closed; no further incoming DATA arrives.  Wakes a waiting {@see readAsync()}. */
+	/**
+	 * Marks the peer as half-closed; no further incoming DATA arrives.  Wakes a waiting
+	 * {@see readAsync()} and {@see awaitResponse()}.
+	 */
 	public function markRemoteClosed(): void
 	{
 		$this->setRemoteClosedDirect(true);
-		$this->wakeWaiter();
+		$this->wakeWaiter(self::WAIT_READ);
+		$this->wakeWaiter(self::WAIT_RESPONSE);
 	}
 
 	/**
@@ -482,7 +580,7 @@ class TH2Stream extends TComponent implements StreamInterface
 	{
 		$this->setRemoteClosedDirect(true);
 		$this->setLocalClosedDirect(true);
-		$this->wakeWaiter();
+		$this->wakeAllWaiters();
 	}
 
 	/**
@@ -497,6 +595,7 @@ class TH2Stream extends TComponent implements StreamInterface
 	public function markLocalClosed(): void
 	{
 		$this->setLocalClosedDirect(true);
+		$this->wakeWaiter(self::WAIT_WRITE);
 		$this->getSessionDirect()->resumeStream($this->getStreamIdDirect());
 	}
 
@@ -550,12 +649,14 @@ class TH2Stream extends TComponent implements StreamInterface
 	/**
 	 * Merges additional headers into the stream (e.g. response headers on the client side); a name
 	 * already present takes the new value.  Keys are kept as given, so a digit-only field name such
-	 * as `123` survives (PHP stores it as an integer key).
+	 * as `123` survives (PHP stores it as an integer key).  Wakes a waiting {@see awaitResponse()},
+	 * which checks whether the merged block is the final response.
 	 * @param array<string, string> $headers The headers to merge.
 	 */
 	public function mergeHeaders(array $headers): void
 	{
 		$this->setHeadersDirect(array_replace($this->getHeadersDirect(), $headers));
+		$this->wakeWaiter(self::WAIT_RESPONSE);
 	}
 
 	// =========================================================================
@@ -614,22 +715,142 @@ class TH2Stream extends TComponent implements StreamInterface
 		if ($this->hasIncoming() || $this->getRemoteClosedDirect()) {
 			return;
 		}
-		if ($this->getWaiterDirect() !== null) {
-			throw new \RuntimeException('Another fiber already waits for bytes on this HTTP/2 stream.');
+		$this->suspendOn(self::WAIT_READ, $token);
+	}
+
+	// =========================================================================
+	// Fiber-aware writes
+	// =========================================================================
+
+	/**
+	 * Queues bytes for outgoing DATA frames as {@see write()} does, then suspends the current fiber
+	 * on the {@see TAsync::getLoop() loop} while more than the {@see getWriteHighWaterMark()
+	 * high-water mark} is queued.  The data provider drains the queue into DATA frames as the peer's
+	 * flow-control window allows, and each {@see drainOutgoing()} resumes the fiber through the loop
+	 * to re-check the queue.  The bytes are queued in full before the wait, so the queue holds at
+	 * most the mark plus one write, and a write never stalls on a closed window with nothing queued.
+	 * Call it from a fiber the loop resumes, never from inside a session event handler (a wait
+	 * there is the `http2_session_busy` case).  One fiber waits to write per stream.
+	 * @param string $string The bytes to send.
+	 * @param ?TCancellationToken $token A token whose cancellation ends the wait; the bytes stay queued.
+	 * @throws TCancelledException When the token is cancelled while waiting.
+	 * @throws \RuntimeException When the stream is not writable (closed, detached, or local-closed),
+	 *   when it closes while the fiber waits, or when another fiber already waits to write.
+	 * @return int The number of bytes queued.
+	 * @since 1.2.1
+	 */
+	public function writeAsync(string $string, ?TCancellationToken $token = null): int
+	{
+		$count = $this->write($string);
+		$this->waitWritable($token);
+		return $count;
+	}
+
+	/**
+	 * Suspends the current fiber until the queued outgoing bytes are at or below the
+	 * {@see getWriteHighWaterMark() high-water mark}.  Returns at once when they already are.  The
+	 * bare wait behind {@see writeAsync()}, for code that queues with {@see write()} itself.
+	 * @param ?TCancellationToken $token A token whose cancellation ends the wait.
+	 * @throws TCancelledException When the token is cancelled while waiting, or was cancelled before.
+	 * @throws \RuntimeException When the stream is not writable (closed, detached, or local-closed),
+	 *   when it closes while the fiber waits, or when another fiber already waits to write.
+	 * @since 1.2.1
+	 */
+	public function waitWritable(?TCancellationToken $token = null): void
+	{
+		$token?->throwIfCancelled();
+		while (true) {
+			if (!$this->isWritable()) {
+				throw new \RuntimeException('Cannot write to a non-writable HTTP/2 stream; the local side is closed.');
+			}
+			if ($this->getOutgoingLength() <= $this->effectiveWriteHighWaterMark()) {
+				return;
+			}
+			$this->suspendOn(self::WAIT_WRITE, $token);
+		}
+	}
+
+	/**
+	 * Returns the high-water mark in effect: the set mark, else the peer's remaining flow-control
+	 * window for the stream (zero once the session is closed or nghttp2 no longer has the stream).
+	 * @return int The mark in bytes.
+	 */
+	private function effectiveWriteHighWaterMark(): int
+	{
+		$mark = $this->getWriteHighWaterMarkDirect();
+		if ($mark !== null) {
+			return $mark;
+		}
+		try {
+			return max(0, $this->getSessionDirect()->getStreamRemoteWindowSize($this->getStreamIdDirect()));
+		} catch (THttp2Exception $e) {
+			return 0;
+		}
+	}
+
+	// =========================================================================
+	// Fiber-aware response wait
+	// =========================================================================
+
+	/**
+	 * Returns the headers once the final response headers are present ({@see hasFinalResponse()}),
+	 * suspending the current fiber on the {@see TAsync::getLoop() loop} until they arrive on a
+	 * client stream.  A 1xx informational response keeps the wait going; the body then follows
+	 * through {@see readAsync()}.  Returns at once when a final response is already present.
+	 * Call it from a fiber the loop resumes, never from inside a session event handler.  One fiber
+	 * waits for the response per stream.  A server stream has no response, so the wait ends only
+	 * with the stream.
+	 * @param ?TCancellationToken $token A token whose cancellation ends the wait.
+	 * @throws TCancelledException When the token is cancelled while waiting, or was cancelled before.
+	 * @throws \RuntimeException When the stream ends (reset, session close, or the peer finishing
+	 *   without one) before a final response, or another fiber already waits for it.
+	 * @return array<string, string> The headers, including the response pseudo-headers.
+	 * @since 1.2.1
+	 */
+	public function awaitResponse(?TCancellationToken $token = null): array
+	{
+		$token?->throwIfCancelled();
+		while (true) {
+			if ($this->hasFinalResponse()) {
+				return $this->getHeadersDirect();
+			}
+			if ($this->getDetachedDirect() || $this->getRemoteClosedDirect()) {
+				throw new \RuntimeException('The HTTP/2 stream ended before a final response arrived.');
+			}
+			$this->suspendOn(self::WAIT_RESPONSE, $token);
+		}
+	}
+
+	// =========================================================================
+	// Wait plumbing
+	// =========================================================================
+
+	/**
+	 * Suspends the current fiber on the loop until {@see wakeWaiter()} is called for the kind or
+	 * the token is cancelled.  One fiber waits per kind.
+	 * @param string $kind The wait kind: {@see WAIT_READ}, {@see WAIT_WRITE}, or {@see WAIT_RESPONSE}.
+	 * @param ?TCancellationToken $token A token whose cancellation ends the wait.
+	 * @throws TCancelledException When the token is cancelled while waiting.
+	 * @throws \RuntimeException When another fiber already waits for the kind.
+	 */
+	private function suspendOn(string $kind, ?TCancellationToken $token): void
+	{
+		if ($this->getWaiterDirect($kind) !== null) {
+			throw new \RuntimeException("Another fiber already waits on this HTTP/2 stream ($kind).");
 		}
 		$suspension = TAsync::getLoop()->suspension();
-		$this->setWaiterDirect($suspension);
-		$subscription = $token?->subscribe(function (TCancelledException $reason) use ($suspension): void {
-			if ($this->getWaiterDirect() === $suspension) {
-				$this->setWaiterDirect(null);
+		$this->setWaiterDirect($suspension, $kind);
+		$subscription = $token?->subscribe(function (TCancelledException $reason) use ($suspension, $kind): void {
+			if ($this->getWaiterDirect($kind) === $suspension) {
+				$this->setWaiterDirect(null, $kind);
 				$suspension->throw($reason);
 			}
 		});
 		try {
 			$suspension->suspend();
 		} finally {
-			if ($this->getWaiterDirect() === $suspension) {
-				$this->setWaiterDirect(null);
+			if ($this->getWaiterDirect($kind) === $suspension) {
+				$this->setWaiterDirect(null, $kind);
 			}
 			if ($subscription !== null) {
 				$token->unsubscribe($subscription);
@@ -638,15 +859,24 @@ class TH2Stream extends TComponent implements StreamInterface
 	}
 
 	/**
-	 * Resumes the fiber waiting in {@see waitReadable()}, if any.  The loop resumes it on its next
-	 * iteration, so a wake from inside an nghttp2 callback switches no fiber there.
+	 * Resumes the fiber waiting for a kind, if any.  The loop resumes it on its next iteration, so
+	 * a wake from inside an nghttp2 callback switches no fiber there.
+	 * @param string $kind The wait kind: {@see WAIT_READ}, {@see WAIT_WRITE}, or {@see WAIT_RESPONSE}.
 	 */
-	private function wakeWaiter(): void
+	private function wakeWaiter(string $kind): void
 	{
-		$waiter = $this->getWaiterDirect();
+		$waiter = $this->getWaiterDirect($kind);
 		if ($waiter !== null) {
-			$this->setWaiterDirect(null);
+			$this->setWaiterDirect(null, $kind);
 			$waiter->resume();
+		}
+	}
+
+	/** Resumes every waiting fiber: the stream is closing, and each wait re-checks its condition. */
+	private function wakeAllWaiters(): void
+	{
+		foreach ([self::WAIT_READ, self::WAIT_WRITE, self::WAIT_RESPONSE] as $kind) {
+			$this->wakeWaiter($kind);
 		}
 	}
 
@@ -737,7 +967,7 @@ class TH2Stream extends TComponent implements StreamInterface
 		$this->setOutgoingDirect('');
 		$this->setTrailersPendingDirect(false);
 		$this->setTrailersDirect([]);
-		$this->wakeWaiter();
+		$this->wakeAllWaiters();
 		$session = $this->getSessionDirect();
 		if ($remoteOpen) {
 			try {

@@ -177,6 +177,50 @@ $session->attachEventHandler('onRequest', function ($session, $stream) use ($sto
 });
 ```
 
+`TH2Stream::writeAsync($bytes, $token = null)` is the fiber-aware write with backpressure. It queues the bytes as `write()` does, then suspends the fiber while more than the stream's high-water mark is queued; each time the data provider drains the queue into DATA frames the fiber is resumed to re-check, and the write returns once the queue is at or below the mark. The mark defaults to the peer's remaining flow-control window for the stream (`TH2Session::getStreamRemoteWindowSize()`; `getRemoteWindowSize()` is the connection window), so the queue holds what the peer can accept; `setWriteHighWaterMark($bytes)` fixes it instead. The bytes are queued in full before the wait, so the queue holds at most the mark plus one write and never stalls on a closed window with nothing queued. A close while the fiber waits throws; a cancelled token throws and leaves the bytes queued. `waitWritable($token = null)` is the bare wait.
+
+`TH2Stream::awaitResponse($token = null)` suspends a client fiber until the final response headers arrive (a `:status` other than 1xx; `hasFinalResponse()` is the check) and returns the headers; a 1xx keeps the wait going, and a stream that ends first (reset, session close) throws. The body then follows through `readAsync()`.
+
+`TH2Session::pump($transport, $token = null)` drives a session over a `TAsyncStream` transport on the loop, so a server or client needs no I/O loop of its own. Each round flushes `send()` to the transport, returns once the session wants no more I/O (a GOAWAY exchange has completed), otherwise waits until the transport is readable or a submit queued output, and feeds what it reads to `receive()`. Every submit wakes a waiting pump (`respond()`, a stream write from another fiber, `goaway()`, ...), so a worker fiber's response reaches the wire without the caller flushing. End of stream on the transport closes the session; the caller closes the transport. A cancelled token ends the pump and leaves the session open; a Throwable an event handler raised leaves it through `receive()` with the session still usable. One fiber pumps a session at a time (`http2_pump_in_progress`), and the transport's inner stream must own an open PHP stream resource (`http2_pump_transport`).
+
+```php
+use Prado\IO\Async\TAsync;
+use Prado\IO\Async\TAsyncStream;
+use Prado\IO\Socket\TSocketStream;
+
+// Server: one accepted connection, served on the loop
+$session = new TH2Session(true);
+$session->submitSettings([]);
+$session->attachEventHandler('onRequest', function ($session, $stream) {
+    TAsync::run(function () use ($session, $stream) {
+        $body = '';
+        while (($chunk = $stream->readAsync(65536)) !== '') {
+            $body .= $chunk;
+        }
+        $session->respond($stream, [':status' => '200']);
+        $stream->writeAsync(strrev($body));                  // waits while the peer's window is full
+        $stream->markLocalClosed();
+    });
+});
+TAsync::run(fn () => $session->pump(new TAsyncStream(new TSocketStream($accepted))));
+
+// Client: request and response in one fiber
+$client = new TH2Session(false);
+$client->submitSettings([]);
+TAsync::run(fn () => $client->pump(new TAsyncStream(TSocketStream::connect('tcp://example.com:80'))));
+$result = TAsync::run(function () use ($client) {
+    $stream = $client->request([':method' => 'GET', ':scheme' => 'http', ':authority' => 'example.com', ':path' => '/']);
+    $stream->markLocalClosed();
+    $headers = $stream->awaitResponse();                      // suspends until the final response headers
+    $body = '';
+    while (($chunk = $stream->readAsync(65536)) !== '') {
+        $body .= $chunk;
+    }
+    $client->goaway();                                        // the pump returns once the GOAWAY is out
+    return [$headers[':status'], $body];
+})->await();
+```
+
 ### `TNgHttp2` directly
 
 `TNgHttp2::ffi()` returns the bound `\FFI` instance for code that needs the raw nghttp2 API. Constants cover the SETTINGS ids (`SETTINGS_*`), frame types (`FRAME_*`), HTTP/2 error codes (`NO_ERROR`, `CANCEL`, `REFUSED_STREAM`, `INTERNAL_ERROR`, `PROTOCOL_ERROR`, `STREAM_CLOSED`), the `FLAG_END_STREAM`/`DATA_FLAG_*` flags, and `ERR_DEFERRED`. `TNgHttp2::version()` returns the loaded library version; `TNgHttp2::strerror($code)` describes an nghttp2 error.

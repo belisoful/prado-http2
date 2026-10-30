@@ -183,6 +183,8 @@ final class TNgHttp2
 		int nghttp2_session_consume(nghttp2_session *session, int32_t stream_id, size_t size);
 		uint32_t nghttp2_session_get_remote_settings(nghttp2_session *session, int id);
 		uint32_t nghttp2_session_get_local_settings(nghttp2_session *session, int id);
+		int32_t nghttp2_session_get_stream_remote_window_size(nghttp2_session *session, int32_t stream_id);
+		int32_t nghttp2_session_get_remote_window_size(nghttp2_session *session);
 		int nghttp2_session_check_request_allowed(nghttp2_session *session);
 		typedef struct nghttp2_option nghttp2_option;
 		int nghttp2_option_new(nghttp2_option **option_ptr);

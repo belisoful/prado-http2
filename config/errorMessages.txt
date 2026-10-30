@@ -8,3 +8,5 @@ http2_session_closed					= The HTTP/2 session is closed; nghttp2 calls are no lo
 http2_header_duplicate					= The header field "{0}" is given more than once; HTTP/2 field names are case-insensitive.
 http2_alpn_not_negotiated				= The TLS connection did not negotiate HTTP/2 (h2) via ALPN; negotiated: {0}
 http2_session_busy						= The HTTP/2 session is busy: {0}() cannot run while nghttp2 executes an event handler (or a fiber suspended inside one) on this session.
+http2_pump_in_progress					= The HTTP/2 session is already pumped by another fiber.
+http2_pump_transport					= The HTTP/2 pump needs a transport whose inner stream owns an open PHP stream resource.

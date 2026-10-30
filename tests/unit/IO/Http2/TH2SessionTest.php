@@ -1,6 +1,8 @@
 <?php
 
+use Prado\Exceptions\TCancelledException;
 use Prado\IO\Async\TAsync;
+use Prado\IO\Async\TCancellationToken;
 use Prado\IO\Http2\TH2Session;
 use Prado\IO\Http2\TH2Stream;
 use Prado\IO\Http2\THttp2Exception;
@@ -1479,5 +1481,105 @@ class TH2SessionTest extends PHPUnit\Framework\TestCase
 		$client->receive($server->send());
 		self::assertSame('200', $status);
 		self::assertSame('late', $body);
+	}
+
+	public function testAWorkerFiberReadsTheRequestBodyAsItArrives()
+	{
+		if (!class_exists(TAsync::class)) {
+			$this->markTestSkipped('The PRADO async API (Prado\\IO\\Async\\TAsync) is not available.');
+		}
+		$server = new TH2Session(true);
+		$client = new TH2Session(false);
+		$server->submitSettings([]);
+		$client->submitSettings([]);
+		$future = null;
+		$seen = [];
+		$server->attachEventHandler('onRequest', function ($session, $stream) use ($server, &$future, &$seen) {
+			// The fiber consumes the body as DATA arrives: each readAsync() wait yields to the loop, which
+			// resumes the fiber outside any nghttp2 call once receive() has buffered more bytes.
+			$future = TAsync::run(function () use ($server, $stream, &$seen) {
+				$body = '';
+				while (($bytes = $stream->readAsync(1024)) !== '') {
+					$seen[] = $bytes;
+					$body .= $bytes;
+				}
+				$server->respond($stream, [':status' => '200']);
+				$stream->write(strtoupper($body));
+				$stream->markLocalClosed();
+				return $body;
+			});
+		});
+		$status = null;
+		$echo = '';
+		$client->attachEventHandler('onResponse', function ($session, $stream) use (&$status) {
+			$status = $stream->getHeader(':status');
+		});
+		$client->attachEventHandler('onData', function ($session, $stream) use (&$echo) {
+			$echo .= $stream->getContents();
+		});
+		$clientStream = $client->request([':method' => 'POST', ':scheme' => 'http', ':authority' => 'example.com', ':path' => '/upload']);
+
+		$server->receive($client->send());                     // HEADERS: onRequest starts the fiber, which waits
+		$client->receive($server->send());
+		self::assertNotNull($future);
+		self::assertFalse($future->isComplete());
+		self::assertSame([], $seen);
+
+		$clientStream->write('part one, ');
+		$server->receive($client->send());                     // DATA: pushIncoming() wakes the fiber through the loop
+		self::assertSame([], $seen, 'The fiber resumes from the loop, not inside the nghttp2 callback.');
+		TAsync::sleep(0.001);                                  // the main fiber runs the loop: the fiber takes its step
+		self::assertSame(['part one, '], $seen);
+		self::assertFalse($future->isComplete(), 'The fiber waits for the rest of the body.');
+
+		$clientStream->write('part two');
+		$clientStream->markLocalClosed();
+		$server->receive($client->send());                     // DATA with END_STREAM: the last piece, then end of stream
+		self::assertSame('part one, part two', $future->await());
+		self::assertSame(['part one, ', 'part two'], $seen);
+		$client->receive($server->send());
+		self::assertSame('200', $status);
+		self::assertSame('PART ONE, PART TWO', $echo);
+	}
+
+	public function testAWorkerFiberReadWaitEndsWithTheCancelledToken()
+	{
+		if (!class_exists(TAsync::class)) {
+			$this->markTestSkipped('The PRADO async API (Prado\\IO\\Async\\TAsync) is not available.');
+		}
+		$server = new TH2Session(true);
+		$client = new TH2Session(false);
+		$server->submitSettings([]);
+		$client->submitSettings([]);
+		$future = null;
+		$server->attachEventHandler('onRequest', function ($session, $stream) use ($server, &$future) {
+			$future = TAsync::run(function () use ($server, $stream) {
+				try {
+					return $stream->readAsync(1024, new TCancellationToken(0.01));   // a body that never arrives
+				} catch (TCancelledException $e) {
+					$server->respond($stream, [':status' => '408']);
+					$stream->markLocalClosed();
+					throw $e;
+				}
+			});
+		});
+		$status = null;
+		$client->attachEventHandler('onResponse', function ($session, $stream) use (&$status) {
+			$status = $stream->getHeader(':status');
+		});
+		$client->request([':method' => 'POST', ':scheme' => 'http', ':authority' => 'example.com', ':path' => '/upload']);
+		$server->receive($client->send());
+		$client->receive($server->send());
+		self::assertNotNull($future);
+		self::assertFalse($future->isComplete());
+
+		try {
+			$future->await();                                  // the main fiber runs the loop until the timeout cancels the token
+			self::fail('The cancelled token did not end the wait.');
+		} catch (TCancelledException $e) {
+			self::assertTrue($future->isRejected());
+		}
+		$client->receive($server->send());
+		self::assertSame('408', $status, 'The session stays usable after the cancelled wait.');
 	}
 }

@@ -10,8 +10,12 @@
 
 namespace Prado\IO\Http2;
 
+use Prado\Exceptions\TCancelledException;
+use Prado\IO\Async\TAsync;
+use Prado\IO\Async\TCancellationToken;
 use Prado\TComponent;
 use Psr\Http\Message\StreamInterface;
+use Revolt\EventLoop\Suspension;
 
 /**
  * TH2Stream class.
@@ -32,6 +36,13 @@ use Psr\Http\Message\StreamInterface;
  * session close) the session marks both directions closed: buffered bytes stay readable, a write
  * throws.  A {@see read()}, {@see getContents()}, or {@see write()} on a detached stream throws,
  * per PSR-7.
+ *
+ * {@see readAsync()} is the fiber-aware read: it returns buffered bytes, suspends the current
+ * fiber on the {@see TAsync::getLoop() loop} while none are buffered and the peer is still
+ * sending, and returns '' only at end of stream, as {@see \Prado\IO\Async\TAsyncStream::read()}
+ * does.  {@see pushIncoming()} and the remote-close paths resume the waiting fiber through the
+ * loop.  A worker fiber started with `TAsync::run()` from an `onRequest` handler consumes a
+ * request body this way as it arrives.
  *
  * State is self-encapsulated: every field is reached through a protected `get*Direct()`/
  * `set*Direct()` accessor (the byte buffers return by reference), so a subclass can intercept
@@ -86,6 +97,9 @@ class TH2Stream extends TComponent implements StreamInterface
 
 	/** @var int The total number of bytes read, for {@see tell()}. */
 	private int $_readPosition = 0;
+
+	/** @var ?Suspension The fiber suspended in {@see waitReadable()}, awaiting bytes or end of stream. */
+	private ?Suspension $_waiter = null;
 
 	/**
 	 * @param TH2Session $session The owning session.
@@ -328,6 +342,26 @@ class TH2Stream extends TComponent implements StreamInterface
 		$this->_readPosition = $value;
 	}
 
+	/**
+	 * Returns the raw suspension of the fiber waiting for incoming bytes.
+	 * @return ?Suspension The waiting fiber's suspension, or null when no fiber waits.
+	 * @since 1.2.1
+	 */
+	protected function getWaiterDirect(): ?Suspension
+	{
+		return $this->_waiter;
+	}
+
+	/**
+	 * Sets the raw suspension of the fiber waiting for incoming bytes.
+	 * @param ?Suspension $value The waiting fiber's suspension, or null when no fiber waits.
+	 * @since 1.2.1
+	 */
+	protected function setWaiterDirect(?Suspension $value): void
+	{
+		$this->_waiter = $value;
+	}
+
 	// =========================================================================
 	// Properties
 	// =========================================================================
@@ -359,8 +393,8 @@ class TH2Stream extends TComponent implements StreamInterface
 	// =========================================================================
 
 	/**
-	 * Appends received DATA bytes to the incoming buffer (called by {@see TH2Session}).  A detached
-	 * stream drops them: nothing can read them.
+	 * Appends received DATA bytes to the incoming buffer (called by {@see TH2Session}) and wakes a
+	 * fiber waiting in {@see readAsync()}.  A detached stream drops them: nothing can read them.
 	 * @param string $bytes The received bytes.
 	 */
 	public function pushIncoming(string $bytes): void
@@ -370,6 +404,9 @@ class TH2Stream extends TComponent implements StreamInterface
 		}
 		$incoming = &$this->getIncomingDirect();
 		$incoming .= $bytes;
+		if ($bytes !== '') {
+			$this->wakeWaiter();
+		}
 	}
 
 	/**
@@ -428,10 +465,11 @@ class TH2Stream extends TComponent implements StreamInterface
 		return $this->getLocalClosedDirect();
 	}
 
-	/** Marks the peer as half-closed; no further incoming DATA arrives. */
+	/** Marks the peer as half-closed; no further incoming DATA arrives.  Wakes a waiting {@see readAsync()}. */
 	public function markRemoteClosed(): void
 	{
 		$this->setRemoteClosedDirect(true);
+		$this->wakeWaiter();
 	}
 
 	/**
@@ -444,6 +482,7 @@ class TH2Stream extends TComponent implements StreamInterface
 	{
 		$this->setRemoteClosedDirect(true);
 		$this->setLocalClosedDirect(true);
+		$this->wakeWaiter();
 	}
 
 	/**
@@ -517,6 +556,98 @@ class TH2Stream extends TComponent implements StreamInterface
 	public function mergeHeaders(array $headers): void
 	{
 		$this->setHeadersDirect(array_replace($this->getHeadersDirect(), $headers));
+	}
+
+	// =========================================================================
+	// Fiber-aware reads
+	// =========================================================================
+
+	/**
+	 * Reads up to $length buffered incoming bytes, suspending the current fiber on the
+	 * {@see TAsync::getLoop() loop} while none are buffered and the peer is still sending.  Returns
+	 * '' only at end of stream (the peer half-closed and the buffer is drained), as
+	 * {@see \Prado\IO\Async\TAsyncStream::read()} does; {@see read()} returns '' for "nothing
+	 * yet" as well.  The wait ends when {@see pushIncoming()} buffers bytes, when the remote side
+	 * closes ({@see markRemoteClosed()}, {@see markClosed()}, {@see close()}), or when $token is
+	 * cancelled.  Call it from a fiber the loop resumes, such as one started with `TAsync::run()`
+	 * from an `onRequest` handler, never from inside a session event handler: a wait there leaves
+	 * nghttp2 mid-call and the loop's next `receive()` throws `http2_session_busy`.  One fiber waits
+	 * per stream.
+	 * @param int $length The maximum number of bytes to return.
+	 * @param ?TCancellationToken $token A token whose cancellation ends the wait.
+	 * @throws TCancelledException When the token is cancelled while waiting.
+	 * @throws \RuntimeException When the stream is detached/closed, $length is negative, or another
+	 *   fiber already waits on the stream.
+	 * @return string The bytes read, or '' at end of stream.
+	 * @since 1.2.1
+	 */
+	public function readAsync(int $length, ?TCancellationToken $token = null): string
+	{
+		if ($length <= 0) {
+			return $this->read($length);
+		}
+		while (true) {
+			$bytes = $this->read($length);
+			if ($bytes !== '' || $this->getRemoteClosedDirect()) {
+				return $bytes;
+			}
+			$this->waitReadable($token);
+		}
+	}
+
+	/**
+	 * Suspends the current fiber until incoming bytes are buffered or the remote side closes.
+	 * Returns at once when either already holds.  The bare wait behind {@see readAsync()}, for code
+	 * that reads with {@see read()} or {@see getContents()} itself.
+	 * @param ?TCancellationToken $token A token whose cancellation ends the wait.
+	 * @throws TCancelledException When the token is cancelled while waiting, or was cancelled before.
+	 * @throws \RuntimeException When the stream is detached/closed, or another fiber already waits
+	 *   on the stream.
+	 * @since 1.2.1
+	 */
+	public function waitReadable(?TCancellationToken $token = null): void
+	{
+		$token?->throwIfCancelled();
+		if ($this->getDetachedDirect()) {
+			throw new \RuntimeException('Cannot read from a detached or closed HTTP/2 stream.');
+		}
+		if ($this->hasIncoming() || $this->getRemoteClosedDirect()) {
+			return;
+		}
+		if ($this->getWaiterDirect() !== null) {
+			throw new \RuntimeException('Another fiber already waits for bytes on this HTTP/2 stream.');
+		}
+		$suspension = TAsync::getLoop()->suspension();
+		$this->setWaiterDirect($suspension);
+		$subscription = $token?->subscribe(function (TCancelledException $reason) use ($suspension): void {
+			if ($this->getWaiterDirect() === $suspension) {
+				$this->setWaiterDirect(null);
+				$suspension->throw($reason);
+			}
+		});
+		try {
+			$suspension->suspend();
+		} finally {
+			if ($this->getWaiterDirect() === $suspension) {
+				$this->setWaiterDirect(null);
+			}
+			if ($subscription !== null) {
+				$token->unsubscribe($subscription);
+			}
+		}
+	}
+
+	/**
+	 * Resumes the fiber waiting in {@see waitReadable()}, if any.  The loop resumes it on its next
+	 * iteration, so a wake from inside an nghttp2 callback switches no fiber there.
+	 */
+	private function wakeWaiter(): void
+	{
+		$waiter = $this->getWaiterDirect();
+		if ($waiter !== null) {
+			$this->setWaiterDirect(null);
+			$waiter->resume();
+		}
 	}
 
 	// =========================================================================
@@ -606,6 +737,7 @@ class TH2Stream extends TComponent implements StreamInterface
 		$this->setOutgoingDirect('');
 		$this->setTrailersPendingDirect(false);
 		$this->setTrailersDirect([]);
+		$this->wakeWaiter();
 		$session = $this->getSessionDirect();
 		if ($remoteOpen) {
 			try {

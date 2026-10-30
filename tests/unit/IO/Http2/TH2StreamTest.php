@@ -1,5 +1,8 @@
 <?php
 
+use Prado\Exceptions\TCancelledException;
+use Prado\IO\Async\TAsync;
+use Prado\IO\Async\TCancellationToken;
 use Prado\IO\Http2\TH2Session;
 use Prado\IO\Http2\TH2Stream;
 
@@ -339,6 +342,197 @@ class TH2StreamTest extends PHPUnit\Framework\TestCase
 		$stream = new TH2Stream($session, 5, []);
 		$stream->close();
 		self::assertFalse($stream->isReadable());
+	}
+
+	// =========================================================================
+	// readAsync() / waitReadable(): the fiber-aware read on the PRADO 4.4 event loop
+	// =========================================================================
+
+	public function testReadAsyncReturnsBufferedBytesAtOnce()
+	{
+		$this->requireAsync();
+		$stream = $this->stream();
+		$stream->pushIncoming('abcdef');
+		self::assertSame('abc', $stream->readAsync(3), 'Buffered bytes return without a fiber or a loop.');
+		self::assertSame('def', $stream->readAsync(100));
+		self::assertSame(6, $stream->tell());
+		self::assertSame('', $stream->readAsync(0), 'A zero length reads nothing and never waits.');
+	}
+
+	public function testReadAsyncReturnsEmptyOnceTheRemoteSideClosedAndTheBufferDrained()
+	{
+		$this->requireAsync();
+		$stream = $this->stream();
+		$stream->pushIncoming('tail');
+		$stream->markRemoteClosed();
+		self::assertSame('tail', $stream->readAsync(10), 'The buffered bytes come first.');
+		self::assertSame('', $stream->readAsync(10), 'End of stream returns \'\' without waiting.');
+		self::assertTrue($stream->eof());
+	}
+
+	public function testReadAsyncWaitsUntilPushIncomingDeliversBytes()
+	{
+		$this->requireAsync();
+		$stream = $this->stream();
+		$future = TAsync::run(fn () => $stream->readAsync(10));
+		self::assertFalse($future->isComplete(), 'The fiber waits while nothing is buffered.');
+		$stream->pushIncoming('late');
+		self::assertFalse($future->isComplete(), 'The fiber resumes from the loop, not inside pushIncoming().');
+		self::assertSame('late', $future->await());
+		self::assertSame(4, $stream->tell());
+	}
+
+	public function testReadAsyncReadsABodyInPiecesUntilEndOfStream()
+	{
+		$this->requireAsync();
+		$stream = $this->stream();
+		$seen = [];
+		$future = TAsync::run(function () use ($stream, &$seen) {
+			while (($bytes = $stream->readAsync(1024)) !== '') {
+				$seen[] = $bytes;
+			}
+			return implode('', $seen);
+		});
+		$stream->pushIncoming('one ');
+		TAsync::sleep(0.001);                                  // the main fiber runs the loop: the worker takes its step
+		self::assertSame(['one '], $seen, 'The first piece is consumed before the second arrives.');
+		self::assertFalse($future->isComplete());
+		$stream->pushIncoming('two');
+		$stream->markRemoteClosed();
+		self::assertSame('one two', $future->await());
+		self::assertSame(['one ', 'two'], $seen);
+	}
+
+	public function testReadAsyncReturnsEmptyWhenTheRemoteSideClosesWhileWaiting()
+	{
+		$this->requireAsync();
+		$stream = $this->stream();
+		$future = TAsync::run(fn () => $stream->readAsync(10));
+		self::assertFalse($future->isComplete());
+		$stream->markRemoteClosed();
+		self::assertSame('', $future->await());
+	}
+
+	public function testReadAsyncReturnsEmptyWhenMarkClosedEndsTheWait()
+	{
+		$this->requireAsync();
+		$stream = $this->stream();
+		$future = TAsync::run(fn () => $stream->readAsync(10));
+		$stream->markClosed();                                 // nghttp2 closed the stream (peer reset, completion, session close)
+		self::assertSame('', $future->await());
+		self::assertFalse($stream->isWritable());
+	}
+
+	public function testReadAsyncThrowsWhenCloseEndsTheWait()
+	{
+		$this->requireAsync();
+		$stream = $this->stream();
+		$future = TAsync::run(fn () => $stream->readAsync(10));
+		$stream->close();
+		$this->expectException(\RuntimeException::class);
+		$this->expectExceptionMessage('detached or closed');
+		$future->await();
+	}
+
+	public function testReadAsyncThrowsTheCancelledTokenWhileWaiting()
+	{
+		$this->requireAsync();
+		$stream = $this->stream();
+		$token = new TCancellationToken();
+		$future = TAsync::run(fn () => $stream->readAsync(10, $token));
+		self::assertFalse($future->isComplete());
+		$token->cancel();
+		try {
+			$future->await();
+			self::fail('The cancelled token did not end the wait.');
+		} catch (TCancelledException $e) {
+			self::assertSame($token->getReason(), $e);
+		}
+		// The waiter slot is released: a later wait on the stream works and sees the bytes.
+		$future = TAsync::run(fn () => $stream->readAsync(10));
+		$stream->pushIncoming('after');
+		self::assertSame('after', $future->await());
+	}
+
+	public function testReadAsyncThrowsATokenCancelledBeforeTheWait()
+	{
+		$this->requireAsync();
+		$stream = $this->stream();
+		$token = new TCancellationToken();
+		$token->cancel();
+		$this->expectException(TCancelledException::class);
+		$stream->readAsync(10, $token);
+	}
+
+	public function testReadAsyncTokenSubscriptionIsReleasedAfterANormalWake()
+	{
+		$this->requireAsync();
+		$stream = $this->stream();
+		$token = new TCancellationToken();
+		$future = TAsync::run(fn () => $stream->readAsync(10, $token));
+		$stream->pushIncoming('bytes');
+		self::assertSame('bytes', $future->await());
+		$token->cancel();                                      // no suspension is left to throw into
+		self::assertTrue($token->isCancelled());
+		self::assertSame('', $stream->read(10));
+	}
+
+	public function testASecondConcurrentWaitThrows()
+	{
+		$this->requireAsync();
+		$stream = $this->stream();
+		$first = TAsync::run(fn () => $stream->readAsync(10));
+		$second = TAsync::run(fn () => $stream->readAsync(10));
+		self::assertTrue($second->isRejected(), 'The second fiber is refused at once.');
+		try {
+			$second->await();
+			self::fail('The second wait did not throw.');
+		} catch (\RuntimeException $e) {
+			self::assertStringContainsString('already waits', $e->getMessage());
+		}
+		$stream->pushIncoming('bytes');
+		self::assertSame('bytes', $first->await(), 'The first waiter is unaffected.');
+	}
+
+	public function testReadAsyncOnADetachedStreamThrows()
+	{
+		$this->requireAsync();
+		$stream = $this->stream();
+		$stream->close();
+		$this->expectException(\RuntimeException::class);
+		$stream->readAsync(10);
+	}
+
+	public function testReadAsyncNegativeLengthThrows()
+	{
+		$this->requireAsync();
+		$stream = $this->stream();
+		$this->expectException(\RuntimeException::class);
+		$this->expectExceptionMessage('negative');
+		$stream->readAsync(-1);
+	}
+
+	public function testWaitReadableReturnsAtOnceWhenNothingToWaitFor()
+	{
+		$this->requireAsync();
+		$stream = $this->stream();
+		$stream->pushIncoming('x');
+		$stream->waitReadable();                               // bytes are buffered
+		self::assertSame('x', $stream->read(1));
+		$stream->markRemoteClosed();
+		$stream->waitReadable();                               // end of stream
+		self::assertTrue($stream->eof());
+		$stream->close();
+		$this->expectException(\RuntimeException::class);
+		$stream->waitReadable();
+	}
+
+	/** Skips the test when the PRADO 4.4 async API is absent. */
+	private function requireAsync(): void
+	{
+		if (!class_exists(TAsync::class)) {
+			$this->markTestSkipped('The PRADO async API (Prado\\IO\\Async\\TAsync) is not available.');
+		}
 	}
 
 	/**

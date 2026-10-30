@@ -152,6 +152,8 @@ Tuning is passed at creation: `new TH2Session(true, (new TH2Options())->setPeerM
 
 A handler runs inside an nghttp2 callback, so the session is busy until the `receive()` or `send()` that raised it returns. `receive()` throws `http2_session_busy` while any nghttp2 call on the session is in progress, and `send()` throws it while another `send()` is in progress (a `send()` from inside a `receive()` handler is allowed): a nested call would re-enter nghttp2's state machine. This covers PRADO 4.4's fibers (`Prado\IO\Async`). PHP permits a fiber switch inside an FFI callback, so a handler that waits on the event loop (`TAsync::sleep()`, `TFuture::await()`, a `TAsyncStream` read) leaves nghttp2 mid-call while the loop runs, from the main fiber or from a suspended worker fiber, and the loop's next `receive()` on the session is such a re-entry. A handler that needs to wait hands the work to `TAsync::run()` and returns; the fiber resumes from the loop outside any nghttp2 call and may then respond, write, and end the stream. The next `send()` carries what it produced.
 
+`TH2Stream::readAsync($length, $token = null)` is the fiber-aware read, with the `TAsyncStream::read()` contract: it returns buffered bytes when any are present, suspends the current fiber on `TAsync::getLoop()` while the buffer is empty and the peer is still sending, and returns `''` only at end of stream. The session's `receive()` wakes the fiber through the loop when DATA arrives or the remote side closes, so a worker fiber consumes a request body as it arrives without polling `onData`; the synchronous `read()` and `getContents()` are unchanged. A `TCancellationToken` ends the wait with its `TCancelledException`. One fiber waits per stream; a second concurrent wait throws. `waitReadable($token = null)` is the bare wait. Call `readAsync()` from the fiber `TAsync::run()` started, never from inside a handler (a wait there is the `http2_session_busy` case above).
+
 ```php
 use Prado\IO\Async\TAsync;
 
@@ -160,6 +162,16 @@ $session->attachEventHandler('onRequest', function ($session, $stream) use ($bac
         $body = $backend->fetch($stream->getHeader(':path'));   // waits on the loop
         $session->respond($stream, [':status' => '200']);
         $stream->write($body);
+        $stream->markLocalClosed();
+    });
+});
+
+$session->attachEventHandler('onRequest', function ($session, $stream) use ($store) {
+    TAsync::run(function () use ($session, $stream, $store) {
+        while (($chunk = $stream->readAsync(65536)) !== '') {   // suspends until DATA arrives; '' at end of stream
+            $store->append($chunk);
+        }
+        $session->respond($stream, [':status' => '201']);
         $stream->markLocalClosed();
     });
 });

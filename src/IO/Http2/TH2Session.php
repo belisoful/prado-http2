@@ -984,8 +984,8 @@ class TH2Session extends TComponent
 	 * the session no longer {@see wantsIo() wants I/O} (a GOAWAY exchange has completed), otherwise
 	 * suspends the current fiber until the transport is readable or a submit queued output
 	 * ({@see respond()}, a {@see TH2Stream::write()} from another fiber, {@see goaway()}, ...), and
-	 * feeds what it reads to {@see receive()}.  End of stream on the transport closes the session;
-	 * the caller closes the transport.  Event handlers run inside receive(); one that waits hands the
+	 * feeds what it reads to {@see receive()}.  End of stream on the transport, or a failed read (a
+	 * peer that resets the connection), closes the session; the caller closes the transport.  Event handlers run inside receive(); one that waits hands the
 	 * work to `TAsync::run()`, and that fiber's later respond or write wakes the pump.  Call it from
 	 * a worker fiber (`TAsync::run(fn () => $session->pump($transport))`), one per session, or from
 	 * the main fiber, where it runs the loop until it returns.  The transport's inner stream must own
@@ -1029,7 +1029,12 @@ class TH2Session extends TComponent
 				if ($this->awaitTransport($inner, $token) !== self::PUMP_READABLE) {
 					continue;   // a submit queued output: flush it
 				}
-				$bytes = $inner->read(self::PUMP_READ_LENGTH);   // non-blocking: the loop reported it readable
+				try {
+					$bytes = $inner->read(self::PUMP_READ_LENGTH);   // non-blocking: the loop reported it readable
+				} catch (\RuntimeException $e) {
+					$this->close();   // a failed read (a peer reset): the connection is gone
+					return;
+				}
 				if ($bytes === '') {
 					if ($inner->eof()) {
 						$this->close();   // end of stream: the peer is gone

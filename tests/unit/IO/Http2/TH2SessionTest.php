@@ -8,6 +8,7 @@ use Prado\IO\Http2\TH2Session;
 use Prado\IO\Http2\TH2Stream;
 use Prado\IO\Http2\THttp2Exception;
 use Prado\IO\Http2\TNgHttp2;
+use Prado\IO\Socket\TSocketReactor;
 use Prado\IO\Socket\TSocketStream;
 
 /**
@@ -1700,6 +1701,28 @@ class TH2SessionTest extends PHPUnit\Framework\TestCase
 	public function testPumpDrivesAServerAndAClientOverASocketPair()
 	{
 		$this->requirePump();
+		$this->assertPumpedEcho();
+	}
+
+	public function testPumpDrivesAServerAndAClientOnASocketReactorLoop()
+	{
+		$this->requirePump();
+		// The TAsync loop a TSocketServerModule on a TSocketReactor serves with (PRADO 4.4 #1419).
+		$prior = TAsync::getLoop();
+		TAsync::setLoop(new TSocketReactor());
+		try {
+			$this->assertPumpedEcho();
+		} finally {
+			TAsync::setLoop($prior);
+		}
+	}
+
+	/**
+	 * Pumps a server and a client over a socket pair on the TAsync loop and asserts a 300 KB echo:
+	 * worker fibers read and write under backpressure, and each pump returns after the GOAWAY.
+	 */
+	private function assertPumpedEcho(): void
+	{
 		[$serverSocket, $clientSocket] = TSocketStream::pair();
 		$serverTransport = new TAsyncStream($serverSocket);
 		$clientTransport = new TAsyncStream($clientSocket);

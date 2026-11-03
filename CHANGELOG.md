@@ -15,6 +15,7 @@ All notable changes to `belisoful/prado-http2` are recorded here. The format fol
 
 ### Changed
 - Validated against PRADO 4.4 master with fibers on the event loop: the extension uses none of the changed API. The framework now requires `revolt/event-loop`, which arrives through `pradosoft/prado`; a unit test drives the `TAsync::run()` hand-off on the default loop and skips when the async API is absent.
+- Validated against PRADO 4.4 #1419 (`13f3602fd`): `TSocketServerModule::serve()` makes its `EventLoop` the `TAsync` loop while serving, so the fibers that session handlers start resume on a `TSocketReactor` server too, and `TRevoltEventLoop::stop()` outside a run does nothing. The extension's waits and the pump use `TAsync::getLoop()` and never call `stop()`; a unit test pumps a client and a server on a `TSocketReactor` loop.
 
 ## [1.2.1] - 2026-10-07
 

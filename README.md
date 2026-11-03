@@ -221,6 +221,8 @@ $result = TAsync::run(function () use ($client) {
 })->await();
 ```
 
+Every wait suspends the fiber on `TAsync::getLoop()`, so the fiber resumes only while that loop runs. Code that runs a loop of its own makes it the TAsync loop first with `TAsync::setLoop($loop)`. `TSocketServerModule::serve()` does this for its `EventLoop` (a `TRevoltEventLoop` or a `TSocketReactor`), so fibers that session handlers start resume on the server's loop; a `serveLoop()` override that runs a loop of its own sets it itself. The waits and the pump run on either loop. The module watches each connection and raises `onClientData` when it is readable, so a session under the module is driven from that handler (`receive()` the bytes, write what `send()` returns); a pump on the same connection would be a second reader of the socket.
+
 ### `TNgHttp2` directly
 
 `TNgHttp2::ffi()` returns the bound `\FFI` instance for code that needs the raw nghttp2 API. Constants cover the SETTINGS ids (`SETTINGS_*`), frame types (`FRAME_*`), HTTP/2 error codes (`NO_ERROR`, `CANCEL`, `REFUSED_STREAM`, `INTERNAL_ERROR`, `PROTOCOL_ERROR`, `STREAM_CLOSED`), the `FLAG_END_STREAM`/`DATA_FLAG_*` flags, and `ERR_DEFERRED`. `TNgHttp2::version()` returns the loaded library version; `TNgHttp2::strerror($code)` describes an nghttp2 error.

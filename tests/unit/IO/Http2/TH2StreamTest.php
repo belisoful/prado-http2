@@ -465,17 +465,42 @@ class TH2StreamTest extends PHPUnit\Framework\TestCase
 		$stream->readAsync(10, $token);
 	}
 
-	public function testReadAsyncTokenSubscriptionIsReleasedAfterANormalWake()
+	public function testEveryWaitUnsubscribesItsTokenAfterANormalWake()
+	{
+		$this->requireAsync();
+		$stream = $this->stream([':method' => 'GET']);
+		$stream->setWriteHighWaterMark(0);
+		$waits = [
+			TH2Stream::WAIT_READ => [fn ($token) => $stream->readAsync(10, $token), fn () => $stream->pushIncoming('bytes')],
+			TH2Stream::WAIT_WRITE => [fn ($token) => $stream->writeAsync('x', $token), fn () => $stream->drainOutgoing(1)],
+			TH2Stream::WAIT_RESPONSE => [fn ($token) => $stream->awaitResponse($token), fn () => $stream->mergeHeaders([':status' => '200'])],
+		];
+		foreach ($waits as $kind => [$wait, $wake]) {
+			$token = $this->recordingToken();
+			$future = TAsync::run($wait, $token);
+			self::assertFalse($future->isComplete(), "$kind: the fiber waits.");
+			self::assertCount(1, $token->subscribed, "$kind: the wait subscribed to the token.");
+			$wake();
+			$future->await();
+			self::assertSame($token->subscribed, $token->unsubscribed, "$kind: the subscription was released after the wake.");
+			$token->cancel();                                  // no suspension is left to throw into
+		}
+		self::assertSame('', $stream->read(10));
+	}
+
+	public function testACancelledWaitUnsubscribesItsToken()
 	{
 		$this->requireAsync();
 		$stream = $this->stream();
-		$token = new TCancellationToken();
+		$token = $this->recordingToken();
 		$future = TAsync::run(fn () => $stream->readAsync(10, $token));
-		$stream->pushIncoming('bytes');
-		self::assertSame('bytes', $future->await());
-		$token->cancel();                                      // no suspension is left to throw into
-		self::assertTrue($token->isCancelled());
-		self::assertSame('', $stream->read(10));
+		$token->cancel();
+		try {
+			$future->await();
+			self::fail('The cancelled token did not end the wait.');
+		} catch (TCancelledException $e) {
+			self::assertSame($token->subscribed, $token->unsubscribed, 'The subscription was released after the throw.');
+		}
 	}
 
 	public function testASecondConcurrentWaitThrows()
@@ -616,6 +641,23 @@ class TH2StreamTest extends PHPUnit\Framework\TestCase
 		} catch (\RuntimeException $e) {
 			self::assertStringContainsString('local side is closed', $e->getMessage());
 		}
+	}
+
+	public function testWriteAsyncThrowsWhenCloseEndsTheWait()
+	{
+		$this->requireAsync();
+		$stream = $this->stream();
+		$stream->setWriteHighWaterMark(0);
+		$future = TAsync::run(fn () => $stream->writeAsync('x'));
+		self::assertFalse($future->isComplete());
+		$stream->close();                                      // closed locally while the writer waits
+		try {
+			$future->await();
+			self::fail('The close did not end the wait.');
+		} catch (\RuntimeException $e) {
+			self::assertStringContainsString('local side is closed', $e->getMessage());
+		}
+		self::assertSame(0, $stream->getOutgoingLength(), 'close() discarded the queue.');
 	}
 
 	public function testWriteAsyncThrowsWhenAnotherFiberEndsTheLocalSide()
@@ -799,12 +841,79 @@ class TH2StreamTest extends PHPUnit\Framework\TestCase
 		self::assertSame('200', $stream->awaitResponse()[':status'], 'The stream is unaffected by the cancelled wait.');
 	}
 
+	public function testASecondConcurrentResponseWaitThrows()
+	{
+		$this->requireAsync();
+		$stream = $this->stream([':method' => 'GET']);
+		$first = TAsync::run(fn () => $stream->awaitResponse());
+		$second = TAsync::run(fn () => $stream->awaitResponse());
+		self::assertTrue($second->isRejected(), 'The second fiber is refused at once.');
+		try {
+			$second->await();
+			self::fail('The second wait did not throw.');
+		} catch (\RuntimeException $e) {
+			self::assertStringContainsString('already waits', $e->getMessage());
+		}
+		$stream->mergeHeaders([':status' => '200']);
+		self::assertSame('200', $first->await()[':status'], 'The first waiter is unaffected.');
+	}
+
+	public function testAwaitResponseThrowsATokenCancelledBeforeTheWait()
+	{
+		$this->requireAsync();
+		$stream = $this->stream([':method' => 'GET']);
+		$token = new TCancellationToken();
+		$token->cancel();
+		$this->expectException(TCancelledException::class);
+		$stream->awaitResponse($token);
+	}
+
+	public function testHasFinalResponseNeedsANonInformationalStatus()
+	{
+		$stream = $this->stream([':method' => 'GET']);
+		self::assertFalse($stream->hasFinalResponse(), 'No :status yet.');
+		$stream->mergeHeaders([':status' => '']);
+		self::assertFalse($stream->hasFinalResponse(), 'An empty :status is no final response.');
+		$stream->mergeHeaders([':status' => '100']);
+		self::assertFalse($stream->hasFinalResponse(), 'A 1xx is informational.');
+		$stream->mergeHeaders([':status' => '204']);
+		self::assertTrue($stream->hasFinalResponse());
+	}
+
 	/** Skips the test when the PRADO 4.4 async API is absent. */
 	private function requireAsync(): void
 	{
 		if (!class_exists(TAsync::class)) {
 			$this->markTestSkipped('The PRADO async API (Prado\\IO\\Async\\TAsync) is not available.');
 		}
+	}
+
+	/**
+	 * A cancellation token that records the subscription ids handed out and released, to check
+	 * that a wait unsubscribes once it ends.
+	 * @return object{subscribed: string[], unsubscribed: string[]}&TCancellationToken The token.
+	 */
+	private function recordingToken(): TCancellationToken
+	{
+		return new class () extends TCancellationToken {
+			/** @var string[] The subscription ids returned by subscribe(). */
+			public array $subscribed = [];
+			/** @var string[] The subscription ids passed to unsubscribe(). */
+			public array $unsubscribed = [];
+
+			public function subscribe(callable $callback): string
+			{
+				$id = parent::subscribe($callback);
+				$this->subscribed[] = $id;
+				return $id;
+			}
+
+			public function unsubscribe(string $id): void
+			{
+				$this->unsubscribed[] = $id;
+				parent::unsubscribe($id);
+			}
+		};
 	}
 
 	/**

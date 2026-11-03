@@ -235,7 +235,7 @@ final class TNgHttp2
 	/**
 	 * Returns the bound FFI instance, loading libnghttp2 on first use.  Each candidate library is
 	 * probed for its version first, so a library older than {@see MIN_VERSION} is reported as too old
-	 * rather than as a failure to resolve the newer symbols.
+	 * (`http2_library_too_old`); the newer symbols are never resolved against it.
 	 * @throws THttp2Exception `http2_library_too_old` when the only loadable library predates
 	 *   {@see MIN_VERSION}; `http2_library_missing` when no candidate loads.
 	 * @return \FFI The bound nghttp2 FFI instance.

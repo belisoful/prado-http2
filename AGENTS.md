@@ -37,7 +37,7 @@
 ### Documentation Standards
 - Every public method has a PHPDoc block with `@param`/`@return`/`@throws` as applicable, plus at least one descriptive sentence.
 - Classes have a clear top docblock (what/why/how, an example where useful) with `@author` and `@since`.
-- `@since` uses the current version (`1.2.1`).
+- `@since` names the release the change ships in: the next version (`1.3.0` once it is tagged, then the one after), never the last tag.
 - Docblocks are technical, present tense, American English. Banned: antithesis ("not X, it Ys"), em-dash dramatic asides, editorializing/filler, rule-of-three lists. One fact per sentence; prefer subject-verb-object and `condition → result`.
 
 ### Error Handling
@@ -45,6 +45,7 @@
 - `config/errorMessages.txt` is registered system-wide through the `extra.prado.error-messages` entry in composer.json; the framework `messages.txt` is not used.
 - `TNgHttp2::isAvailable()` returns false (rather than throwing) when `libnghttp2` cannot load or is older than `TNgHttp2::MIN_VERSION` (1.60.0), so callers can fall back to HTTP/1.1; `ffi()` throws `http2_library_too_old` or `http2_library_missing`. Every FFI instance `TNgHttp2` creates (version probes, each binding `setLibraryPath()` replaces) is retained for the process life and each candidate is probed once: PHP's per-opline struct-field cache is keyed on the raw type pointer and never invalidated, so a freed instance is a use-after-free for the next one (a segfault on PHP 8.4 and 8.5 with Ubuntu 24.04's libnghttp2 1.59.0 in 1.2.0). Never free an FFI instance whose struct fields were read.
 - Event handlers run inside nghttp2 callbacks, where PHP cannot throw (a fatal error). Every shared callback runs through `guarded()`: a Throwable is held and rethrown by `receive()`/`send()` after nghttp2 returns; the data provider returns `ERR_TEMPORAL_CALLBACK_FAILURE` so only its stream resets. `close()` inside a callback is deferred to `nativeCall()`; never free the nghttp2 session while it executes.
+- `receive()` throws `http2_session_busy` while any nghttp2 call on the session is in progress, and `send()` throws it while another `send()` is (a `send()` inside a `receive()` handler is allowed). PHP permits a fiber switch inside an FFI callback, so a handler that waits on the PRADO 4.4 event loop leaves nghttp2 mid-call; a handler that waits hands the work to `TAsync::run()` and returns. `pump()` throws `http2_pump_in_progress` (a second pumper) and `http2_pump_transport` (a transport whose inner stream owns no open resource).
 
 ### Imports
 - PSR-4 autoloading; no manual includes. `use` statements at the top of the file. Extensions do **not** edit the framework `classes.php`.
@@ -53,6 +54,7 @@
 
 - **libnghttp2 is a system library** resolved at runtime: explicit `TNgHttp2::setLibraryPath()` → `PRADO_NGHTTP2_LIB` env → platform defaults. It is a composer `suggest`/runtime concern, not a hard install requirement of the package.
 - **Memory I/O.** A `TH2Session` is transport-agnostic: `receive($bytes)` feeds the session, `send()` drains its output. Pump these over any transport.
+- **Fibers.** `TH2Stream::readAsync()`/`writeAsync()`/`awaitResponse()` (and the bare `waitReadable()`/`waitWritable()`) suspend the current fiber on `TAsync::getLoop()`, one waiter per kind; `TH2Session::pump(TAsyncStream $transport, $token)` drives a session on the loop, writing what the non-blocking transport accepts and holding the rest so it keeps reading while its output waits. See CLAUDE.md "Re-entry and fibers", "Fiber-aware stream waits", and "Pump".
 - **Callbacks** are PHP closures built **once** and shared by every session, kept alive process-wide in the static `$_sharedRefs` (a closure handed to FFI lives for the FFI instance's life, so per-session closures would leak); each session captures the shared provider/closures (`$_dataProvider`, `$_refs`). Routing to the owning session is via nghttp2's `user_data` through the FFI instance the closures were built with, so two sessions never cross-talk. The routing registry holds `WeakReference`s, so an unreferenced session is collected and its `__destruct` closes it.
 - **Data providers** pull outgoing DATA from per-stream queues; deferred until the stream resumes. `TH2Stream::markLocalClosed()` finishes a finite body (flush then END_STREAM) and resumes the stream so a deferred provider re-arms; `sendTrailers()` ends with a trailing header block; `close()` tears the stream down.
 - **Closed state.** `TH2Session::close()` frees the nghttp2 session and marks the remaining streams closed (`TH2Stream::markClosed()`); every later nghttp2 call throws `http2_session_closed` (`resumeStream()`/`wantsIo()` degrade quietly). A peer reset or completion marks the stream closed the same way before `onClose`.
@@ -77,7 +79,7 @@
 ## Development Environment
 - PHP 8.2+; extensions: ffi (required), openssl (h2 over TLS), plus the framework's ctype, dom, intl, json, pcre, spl.
 - System library: `libnghttp2` 1.60.0 or newer (bound via FFI). CI runs on `ubuntu-26.04` (libnghttp2 1.68.0; 24.04 has 1.59.0) and a workflow step fails when the library does not load, since the tests otherwise skip.
-- `pradosoft/prado ^4.4` is a dev dependency. 4.4 is unreleased, so composer.json resolves it from the sibling `../prado` path repository and CI checks out `pradosoft/prado@master` there (weekly scheduled run included).
+- `pradosoft/prado ^4.4` is a dev dependency. 4.4 is unreleased, so composer.json resolves it from the sibling `../prado` path repository and CI checks out `pradosoft/prado@master` there (weekly scheduled run included). The framework's own dependencies (`revolt/event-loop`, `psr/cache`, `psr/simple-cache`) install through it; after the framework adds one, run `composer update` (the lock file is not committed).
 - Composer for dependency management; presume dependencies are installed.
 
 # PRADO Framework Agent Safeguards — ANTI-PATTERNS

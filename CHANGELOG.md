@@ -3,20 +3,23 @@
 All notable changes to `belisoful/prado-http2` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.3.0] - 2026-11-03
 
 ### Added
 - Error code `http2_session_busy`: `receive()` throws it while any nghttp2 call on the session is in progress, and `send()` throws it while another `send()` is in progress (a `send()` from inside a `receive()` handler stays allowed). A nested `receive()` re-entered nghttp2's inbound state machine with a frame half processed, and a nested `send()` reported the frame in progress twice. PHP permits a fiber switch inside an FFI callback, so with PRADO 4.4's fibers on the event loop (`Prado\IO\Async`) a handler that waited on the loop (`TAsync::sleep()`, `TFuture::await()`) left nghttp2 mid-call while the loop ran, and the loop's next `receive()` on the session was such a re-entry. A handler that waits hands the work to `TAsync::run()` and returns (README, "Event loops and fibers").
-- `TH2Stream::readAsync($length, $token = null)` and `waitReadable($token = null)`: the fiber-aware read, with the `TAsyncStream::read()` contract. Buffered bytes return at once; an empty buffer with the peer still sending suspends the current fiber on the PRADO 4.4 event loop until `receive()` delivers DATA or the remote side closes; `''` means end of stream. A `TCancellationToken` ends the wait with its `TCancelledException`; one fiber waits per stream. A worker fiber started with `TAsync::run()` from `onRequest` consumes a request body as it arrives without polling `onData`. `read()` and `getContents()` are unchanged.
+- `TH2Stream::readAsync($length, $token = null)` and `waitReadable($token = null)`: the fiber-aware read, with the `TAsyncStream::read()` contract. Buffered bytes return at once; an empty buffer with the peer still sending suspends the current fiber on the PRADO 4.4 event loop until `receive()` delivers DATA or the remote side closes; `''` means end of stream. A `TCancellationToken` ends the wait with its `TCancelledException`; one fiber waits to read per stream, and a second concurrent read wait throws. A worker fiber started with `TAsync::run()` from `onRequest` consumes a request body as it arrives without polling `onData`. `read()` and `getContents()` are unchanged.
 - `TH2Stream::writeAsync($bytes, $token = null)` and `waitWritable($token = null)`: the fiber-aware write with backpressure. The bytes are queued in full, then the fiber suspends while more than the high-water mark is queued; each drain into DATA frames resumes it to re-check. `WriteHighWaterMark` (`get`/`set`) defaults to the peer's remaining flow-control window for the stream; `getOutgoingLength()` is the queued byte count. A close while the fiber waits throws; a cancelled token throws and leaves the bytes queued.
 - `TH2Stream::awaitResponse($token = null)` and `hasFinalResponse()`: a client fiber waits for the final response headers (a `:status` other than 1xx); a 1xx keeps the wait going, and a stream that ends first throws.
-- `TH2Session::pump(TAsyncStream $transport, $token = null)`: drives a session over a transport on the event loop. It flushes `send()`, waits until the transport is readable or a submit queued output, feeds `receive()`, and returns once the session wants no more I/O or the token is cancelled; end of stream on the transport, or a failed read (a peer reset), closes the session. Error codes `http2_pump_in_progress` (a second pumper) and `http2_pump_transport` (a transport whose inner stream owns no open resource).
+- `TH2Session::pump(TAsyncStream $transport, $token = null)`: drives a session over a transport on the event loop. Each round drains `send()`, writes what the non-blocking transport accepts and holds the rest, waits until the transport is readable, accepts more of the held output, or a submit queued output, and feeds what it reads to `receive()`. The pump keeps reading while its own output waits, so two pumped peers that both send more than the socket buffer holds (an RFC 8441 tunnel streaming both ways) make progress. It returns once nothing is held and the session wants no more I/O, and throws `TCancelledException` when the token is cancelled, with the session open and the held output kept for the next `send()`. End of stream on the transport, or a read or write that fails (a peer reset), closes the session. Error codes `http2_pump_in_progress` (a second pumper) and `http2_pump_transport` (a transport whose inner stream owns no open resource).
 - `TH2Session::getStreamRemoteWindowSize($streamId)` and `getRemoteWindowSize()`: the peer's remaining flow-control windows; `nghttp2_session_get_stream_remote_window_size` and `nghttp2_session_get_remote_window_size` in the FFI declaration.
 
 ### Changed
 - Validated against PRADO 4.4 master with fibers on the event loop: the extension uses none of the changed API. The framework now requires `revolt/event-loop`, which arrives through `pradosoft/prado`; a unit test drives the `TAsync::run()` hand-off on the default loop and skips when the async API is absent.
 - Validated against PRADO 4.4 #1419 (`13f3602fd`): `TSocketServerModule::serve()` makes its `EventLoop` the `TAsync` loop while serving, so the fibers that session handlers start resume on a `TSocketReactor` server too, and `TRevoltEventLoop::stop()` outside a run does nothing. The extension's waits and the pump use `TAsync::getLoop()` and never call `stop()`; a unit test pumps a client and a server on a `TSocketReactor` loop.
 - Validated against PRADO 4.4 #1437 (`9a1dfccc0`): a message from a message file is an ICU MessageFormat pattern. Every `http2_*` message parses as ICU and formats as before; `THttp2ExceptionTest` checks this.
+
+### Upgrading
+- `receive()` from inside any event handler, and `send()` from inside an `onFrameSent` handler, now throw `http2_session_busy`. A handler that needs the result of a nested call hands the work to `TAsync::run()` and returns; a `send()` from inside a `receive()` handler still works.
 
 ## [1.2.1] - 2026-10-07
 
@@ -99,6 +102,7 @@ All notable changes to `belisoful/prado-http2` are recorded here. The format fol
 ### Added
 - Initial release: `TNgHttp2` FFI binding over the system `libnghttp2`, `TH2Session` (server and client, memory I/O, shared callbacks), `TH2Stream` (duplex PSR-7 stream), `TH2Options`, `THttp2Exception`, in-process unit tests, and a `curl --http2-prior-knowledge` interoperability test.
 
+[1.3.0]: https://github.com/belisoful/prado-http2/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/belisoful/prado-http2/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/belisoful/prado-http2/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/belisoful/prado-http2/compare/v1.0.0...v1.1.0

@@ -1,6 +1,7 @@
 <?php
 
 use Prado\Exceptions\TCancelledException;
+use Prado\Exceptions\TPhpErrorException;
 use Prado\IO\Async\TAsync;
 use Prado\IO\Async\TAsyncStream;
 use Prado\IO\Async\TCancellationToken;
@@ -1365,6 +1366,82 @@ class TH2SessionTest extends PHPUnit\Framework\TestCase
 		self::assertSame(1, $client->getRemoteSetting(TNgHttp2::SETTINGS_ENABLE_CONNECT_PROTOCOL));
 	}
 
+	public function testSendWhileASendHandlerIsSuspendedInAFiberThrowsSessionBusy()
+	{
+		$server = new TH2Session(true);
+		$client = new TH2Session(false);
+		$server->submitSettings([TNgHttp2::SETTINGS_ENABLE_CONNECT_PROTOCOL => 1]);
+		$client->submitSettings([]);
+		$server->attachEventHandler('onFrameSent', function ($session, $info) {
+			\Fiber::suspend();                                 // the handler waits; nghttp2 stays mid-send on this fiber
+		});
+		$output = null;
+		$fiber = new \Fiber(function () use ($server, &$output) {
+			$output = $server->send();
+		});
+		$fiber->start();
+		self::assertTrue($fiber->isSuspended(), 'The send handler suspended inside the nghttp2 callback.');
+
+		// The event loop (or any other fiber) reaching the session meanwhile is refused.
+		try {
+			$server->send();
+			self::fail('send() while a send handler is suspended must throw http2_session_busy.');
+		} catch (THttp2Exception $e) {
+			self::assertSame('http2_session_busy', $e->getErrorCode());
+		}
+		try {
+			$server->receive(self::EMPTY_SETTINGS_FRAME);
+			self::fail('receive() while a send handler is suspended must throw http2_session_busy.');
+		} catch (THttp2Exception $e) {
+			self::assertSame('http2_session_busy', $e->getErrorCode());
+		}
+
+		$fiber->resume();
+		self::assertTrue($fiber->isTerminated());
+		self::assertIsString($output);
+		$client->receive($output);
+		self::assertSame(1, $client->getRemoteSetting(TNgHttp2::SETTINGS_ENABLE_CONNECT_PROTOCOL), 'The suspended send() completed.');
+	}
+
+	public function testRemoteWindowSizesTrackDataSentAndAnUnknownStreamIsMinusOne()
+	{
+		[$server, $client] = $this->newPair();
+		$this->pump($server, $client, 1);                      // SETTINGS exchanged: the default windows apply
+		self::assertSame(65535, $client->getRemoteWindowSize());
+		self::assertSame(-1, $client->getStreamRemoteWindowSize(99), 'A stream nghttp2 does not have.');
+		$stream = $client->request([':method' => 'POST', ':scheme' => 'http', ':authority' => 'example.com', ':path' => '/window']);
+		self::assertSame(-1, $client->getStreamRemoteWindowSize($stream->getStreamId()), 'nghttp2 opens the stream once the HEADERS is sent.');
+		$server->receive($client->send());                     // HEADERS: the stream opens with the default window
+		self::assertSame(65535, $client->getStreamRemoteWindowSize($stream->getStreamId()));
+		$stream->write(str_repeat('w', 1000));
+		$server->receive($client->send());                     // 1000 bytes of DATA
+		self::assertSame(65535 - 1000, $client->getStreamRemoteWindowSize($stream->getStreamId()));
+		self::assertSame(65535 - 1000, $client->getRemoteWindowSize());
+		$stream->markLocalClosed();
+		$server->attachEventHandler('onRequest', function () {
+		});
+		$serverStream = $server->getStream($stream->getStreamId());
+		self::assertNotNull($serverStream);
+		$server->respond($serverStream, [':status' => '204']);
+		$serverStream->markLocalClosed();
+		$this->pump($server, $client, 4);                      // the stream completes: nghttp2 forgets it
+		self::assertSame(-1, $client->getStreamRemoteWindowSize($stream->getStreamId()));
+		$client->close();
+		try {
+			$client->getRemoteWindowSize();
+			self::fail('A closed session must throw.');
+		} catch (THttp2Exception $e) {
+			self::assertSame('http2_session_closed', $e->getErrorCode());
+		}
+		try {
+			$client->getStreamRemoteWindowSize(1);
+			self::fail('A closed session must throw.');
+		} catch (THttp2Exception $e) {
+			self::assertSame('http2_session_closed', $e->getErrorCode());
+		}
+		$server->close();
+	}
+
 	public function testSendInsideAReceiveHandlerIsAllowed()
 	{
 		$server = new TH2Session(true);
@@ -1651,10 +1728,10 @@ class TH2SessionTest extends PHPUnit\Framework\TestCase
 		$client = new TH2Session(false);
 		$server->submitSettings([]);
 		$client->submitSettings([]);
-		$server->attachEventHandler('onRequest', function ($session, $stream) use ($server) {
-			$server->respond($stream, [':status' => '200', 'content-type' => 'text/plain']);
-			$stream->write('pong');
-			$stream->markLocalClosed();
+		$serverStream = null;
+		$server->attachEventHandler('onRequest', function ($session, $stream) use ($server, &$serverStream) {
+			$serverStream = $stream;
+			$server->respond($stream, [':status' => '103', 'link' => '</style.css>; rel=preload']);
 		});
 		$clientStream = $client->request([':method' => 'GET', ':scheme' => 'http', ':authority' => 'example.com', ':path' => '/ping']);
 		$clientStream->markLocalClosed();
@@ -1664,13 +1741,22 @@ class TH2SessionTest extends PHPUnit\Framework\TestCase
 			while (($bytes = $clientStream->readAsync(1024)) !== '') {
 				$body .= $bytes;
 			}
-			return [$headers[':status'], $headers['content-type'], $body];
+			return [$headers[':status'], $headers['content-type'], $headers['link'], $body];
 		});
 		self::assertFalse($future->isComplete());
 
 		$server->receive($client->send());
+		$client->receive($server->send());                     // 103: an informational response
+		TAsync::sleep(0.001);                                  // the loop resumes the fiber, which keeps waiting
+		self::assertFalse($future->isComplete(), 'A 1xx response keeps the fiber waiting.');
+		self::assertSame('103', $clientStream->getHeader(':status'));
+		self::assertFalse($clientStream->hasFinalResponse());
+
+		$server->respond($serverStream, [':status' => '200', 'content-type' => 'text/plain']);
+		$serverStream->write('pong');
+		$serverStream->markLocalClosed();
 		$client->receive($server->send());
-		self::assertSame(['200', 'text/plain', 'pong'], $future->await());
+		self::assertSame(['200', 'text/plain', '</style.css>; rel=preload', 'pong'], $future->await());
 	}
 
 	public function testAwaitResponseThrowsWhenTheServerResetsTheStream()
@@ -1689,9 +1775,15 @@ class TH2SessionTest extends PHPUnit\Framework\TestCase
 
 		$server->receive($client->send());
 		$client->receive($server->send());                     // RST_STREAM: nghttp2 closes the stream, no response
-		$this->expectException(\RuntimeException::class);
-		$this->expectExceptionMessage('before a final response');
-		$future->await();                                      // the loop resumes the fiber, which re-checks and throws
+		try {
+			$future->await();                                  // the loop resumes the fiber, which re-checks and throws
+			self::fail('The reset did not end the wait.');
+		} catch (\RuntimeException $e) {
+			self::assertStringContainsString('before a final response', $e->getMessage());
+		}
+		self::assertNull($client->getStream($clientStream->getStreamId()), 'nghttp2 closed the stream.');
+		$server->close();
+		$client->close();
 	}
 
 	// =========================================================================
@@ -1775,7 +1867,8 @@ class TH2SessionTest extends PHPUnit\Framework\TestCase
 		$server->submitSettings([]);
 		$pump = TAsync::run(fn () => $server->pump($transport, new TCancellationToken(10.0)));
 		self::assertFalse($pump->isComplete(), 'The pump waits for the peer.');
-		$clientSocket->close();                                // the peer hangs up
+		self::assertContains(TNgHttp2::FRAME_SETTINGS, $this->frameTypes($clientSocket->read(65536)), 'The pump wrote the SETTINGS.');
+		$clientSocket->close();                                // the peer hangs up with nothing unread: end of stream, no reset
 		$pump->await();
 		try {
 			$server->ping();
@@ -1783,7 +1876,235 @@ class TH2SessionTest extends PHPUnit\Framework\TestCase
 		} catch (THttp2Exception $e) {
 			self::assertSame('http2_session_closed', $e->getErrorCode());
 		}
+		self::assertTrue($serverSocket->eof(), 'The transport reports end of stream.');
 		$transport->close();
+	}
+
+	public function testPumpClosesTheSessionWhenTheTransportWriteFails()
+	{
+		$this->requirePump();
+		// fwrite() on a socket the peer reset raises an E_NOTICE: TPhpErrorException under the PRADO
+		// error handler, RuntimeException from TStream otherwise.  Both close the session.
+		$failures = [
+			new \RuntimeException('Unable to write to stream'),
+			new TPhpErrorException(E_NOTICE, 'fwrite(): Send of 17 bytes failed with errno=32 Broken pipe', __FILE__, __LINE__),
+		];
+		foreach ($failures as $failure) {
+			[$serverSocket, $clientSocket] = TSocketStream::pair();
+			$failing = new class ($serverSocket->detach(), $failure) extends TSocketStream {
+				public function __construct(mixed $resource, private \Throwable $failure)
+				{
+					parent::__construct($resource);
+				}
+
+				public function write(string $string): int
+				{
+					throw $this->failure;
+				}
+			};
+			$transport = new TAsyncStream($failing);
+			$server = new TH2Session(true);
+			$server->submitSettings([]);                       // output to write on the first round
+			$pump = TAsync::run(fn () => $server->pump($transport, new TCancellationToken(10.0)));
+			$pump->await();
+			try {
+				$server->ping();
+				self::fail('The session was not closed after the failed write (' . get_class($failure) . ').');
+			} catch (THttp2Exception $e) {
+				self::assertSame('http2_session_closed', $e->getErrorCode());
+			}
+			$clientSocket->close();
+			$transport->close();
+		}
+	}
+
+	public function testCloseFromAnotherFiberReturnsTheWaitingPump()
+	{
+		$this->requirePump();
+		[$serverSocket, $clientSocket] = TSocketStream::pair();
+		$transport = new TAsyncStream($serverSocket);
+		$server = new TH2Session(true);
+		$server->submitSettings([]);
+		$pump = TAsync::run(fn () => $server->pump($transport, new TCancellationToken(10.0)));
+		self::assertFalse($pump->isComplete(), 'The pump waits for the peer.');
+		$server->close();                                      // from the main fiber, outside any nghttp2 call
+		$pump->await();                                        // returns: no TCancelledException, no error
+		self::assertTrue($pump->isComplete());
+		self::assertFalse($server->wantsIo());
+		try {
+			$server->ping();
+			self::fail('The session is not closed.');
+		} catch (THttp2Exception $e) {
+			self::assertSame('http2_session_closed', $e->getErrorCode());
+		}
+		$clientSocket->close();
+		$transport->close();
+	}
+
+	public function testPumpHoldsOutputTheTransportDoesNotAcceptAndWritesALaterSubmit()
+	{
+		$this->requirePump();
+		[$serverSocket, $clientSocket] = TSocketStream::pair();
+		// A transport that accepts eight bytes per write: every frame is written in pieces, the rest
+		// is held, and the pump waits for writability between the pieces.
+		$throttled = new class ($serverSocket->detach()) extends TSocketStream {
+			public string $written = '';
+			public int $writes = 0;
+
+			public function write(string $string): int
+			{
+				$count = parent::write(substr($string, 0, 8));
+				$this->written .= substr($string, 0, $count);
+				$this->writes++;
+				return $count;
+			}
+		};
+		$transport = new TAsyncStream($throttled);
+		$server = new TH2Session(true);
+		$server->submitSettings([]);
+		$token = new TCancellationToken();
+		$pump = TAsync::run(fn () => $server->pump($transport, $token));
+		$server->ping('abcdefgh');                             // submitted while the SETTINGS are still held
+		TAsync::sleep(0.05);                                   // the main fiber runs the loop: the pump writes piece by piece
+		self::assertSame([TNgHttp2::FRAME_SETTINGS, TNgHttp2::FRAME_PING], $this->frameTypes($throttled->written));
+		self::assertGreaterThan(2, $throttled->writes, 'The frames went out in pieces.');
+		self::assertSame($throttled->written, $clientSocket->read(65536), 'The peer received every byte once, in order.');
+		self::assertFalse($pump->isComplete(), 'Nothing is held: the pump waits for the peer.');
+		$token->cancel();
+		try {
+			$pump->await();
+			self::fail('The token did not end the pump.');
+		} catch (TCancelledException $e) {
+			self::assertSame('', $server->send(), 'No output was left behind.');
+		}
+		$clientSocket->close();
+		$transport->close();
+	}
+
+	public function testPumpKeepsHeldOutputForTheNextSendWhenTheTokenCancelsIt()
+	{
+		$this->requirePump();
+		[$serverSocket, $clientSocket] = TSocketStream::pair();
+		$refusing = new class ($serverSocket->detach()) extends TSocketStream {
+			public function write(string $string): int
+			{
+				return 0;                                      // the socket buffer is full
+			}
+		};
+		$transport = new TAsyncStream($refusing);
+		$server = new TH2Session(true);
+		$server->submitSettings([TNgHttp2::SETTINGS_ENABLE_CONNECT_PROTOCOL => 1]);
+		$pump = TAsync::run(fn () => $server->pump($transport, new TCancellationToken(0.02)));
+		try {
+			$pump->await();
+			self::fail('The token did not end the pump.');
+		} catch (TCancelledException $e) {
+			self::assertTrue($server->wantsIo(), 'The session stays open.');
+		}
+		$held = $server->send();                               // the bytes the transport never accepted come first
+		self::assertSame([TNgHttp2::FRAME_SETTINGS], $this->frameTypes($held));
+		$client = new TH2Session(false);
+		$client->submitSettings([]);
+		$client->receive($held);
+		self::assertSame(1, $client->getRemoteSetting(TNgHttp2::SETTINGS_ENABLE_CONNECT_PROTOCOL), 'The peer misses nothing.');
+		$clientSocket->close();
+		$transport->close();
+	}
+
+	public function testPumpWaitsAgainWhenTheTransportIsReadableWithoutBytes()
+	{
+		$this->requirePump();
+		[$serverSocket, $clientSocket] = TSocketStream::pair();
+		// The first read yields nothing with the stream still open (TLS bookkeeping); the next read is real.
+		$sparse = new class ($serverSocket->detach()) extends TSocketStream {
+			public int $reads = 0;
+
+			public function read(int $length): string
+			{
+				return ++$this->reads === 1 ? '' : parent::read($length);
+			}
+		};
+		$transport = new TAsyncStream($sparse);
+		$server = new TH2Session(true);
+		$server->submitSettings([]);
+		$requested = null;
+		$server->attachEventHandler('onRequest', function ($session, $stream) use ($server, &$requested) {
+			$requested = $stream->getHeader(':path');
+			$server->respond($stream, [':status' => '204']);
+			$stream->markLocalClosed();
+		});
+		$pump = TAsync::run(fn () => $server->pump($transport, new TCancellationToken(10.0)));
+		$client = new TH2Session(false);
+		$client->submitSettings([]);
+		$client->request([':method' => 'GET', ':scheme' => 'http', ':authority' => 'example.com', ':path' => '/sparse'])->markLocalClosed();
+		$clientSocket->write($client->send());
+		TAsync::sleep(0.05);                                   // the pump reads '' once, waits again, then reads the request
+		self::assertSame('/sparse', $requested);
+		self::assertGreaterThanOrEqual(2, $sparse->reads);
+		self::assertFalse($pump->isComplete(), 'The empty read did not close the session.');
+		self::assertTrue($server->wantsIo());
+		$server->close();
+		$pump->await();
+		$clientSocket->close();
+		$transport->close();
+	}
+
+	public function testPumpMovesDataBothWaysAtOnce()
+	{
+		$this->requirePump();
+		// Both peers stream on one stream at the same time, with more in flight than any socket
+		// buffer holds (1 MiB windows), so each pump must keep reading while its own output waits.
+		$size = 1000000;
+		$window = 1048576;
+		[$serverSocket, $clientSocket] = TSocketStream::pair();
+		$serverTransport = new TAsyncStream($serverSocket);
+		$clientTransport = new TAsyncStream($clientSocket);
+		$server = new TH2Session(true);
+		$client = new TH2Session(false);
+		foreach ([$server, $client] as $session) {
+			$session->submitSettings([TNgHttp2::SETTINGS_INITIAL_WINDOW_SIZE => $window]);
+			$session->submitWindowUpdate(0, $window - 65535);
+		}
+		$workers = [];
+		$serverGot = 0;
+		$server->attachEventHandler('onRequest', function ($session, $stream) use ($server, $size, &$workers, &$serverGot) {
+			$server->respond($stream, [':status' => '200']);
+			$workers[] = TAsync::run(function () use ($stream, $size) {
+				$stream->writeAsync(str_repeat('s', $size));
+				$stream->markLocalClosed();
+			});
+			$workers[] = TAsync::run(function () use ($stream, &$serverGot) {
+				while (($bytes = $stream->readAsync(65536)) !== '') {
+					$serverGot += strlen($bytes);
+				}
+			});
+		});
+		$token = new TCancellationToken(10.0);
+		$serverPump = TAsync::run(fn () => $server->pump($serverTransport, $token));
+		$clientPump = TAsync::run(fn () => $client->pump($clientTransport, $token));
+		$exchange = TAsync::run(function () use ($client, $size, &$workers) {
+			$stream = $client->request([':method' => 'POST', ':scheme' => 'http', ':authority' => 'example.com', ':path' => '/duplex']);
+			$workers[] = TAsync::run(function () use ($stream, $size) {
+				$stream->writeAsync(str_repeat('c', $size));
+				$stream->markLocalClosed();
+			});
+			$stream->awaitResponse();
+			$got = 0;
+			while (($bytes = $stream->readAsync(65536)) !== '') {
+				$got += strlen($bytes);
+			}
+			return $got;
+		});
+		self::assertSame($size, $exchange->await(), 'The client read the whole response while it was still sending.');
+		foreach ($workers as $worker) {
+			$worker->await();
+		}
+		self::assertSame($size, $serverGot, 'The server read the whole request while it was still sending.');
+		$client->goaway();
+		$clientPump->await();
+		$serverPump->await();
+		$clientTransport->close();
+		$serverTransport->close();
 	}
 
 	public function testPumpClosesTheSessionWhenTheTransportReadFails()
@@ -1829,8 +2150,12 @@ class TH2SessionTest extends PHPUnit\Framework\TestCase
 		}
 		$again = TAsync::run(fn () => $server->pump($transport, new TCancellationToken(0.02)));
 		self::assertFalse($again->isComplete(), 'The pump can be called again.');
-		$this->expectException(TCancelledException::class);
-		$again->await();
+		try {
+			$again->await();
+			self::fail('The second token did not end the pump.');
+		} catch (TCancelledException $e) {
+			self::assertTrue($server->wantsIo(), 'The session stays open.');
+		}
 		$clientSocket->close();
 		$transport->close();
 	}
@@ -1853,8 +2178,9 @@ class TH2SessionTest extends PHPUnit\Framework\TestCase
 		$token->cancel();
 		try {
 			$pump->await();
+			self::fail('The cancelled token did not end the first pump.');
 		} catch (TCancelledException $e) {
-			// the first pump ended
+			self::assertTrue($pump->isRejected());
 		}
 		try {
 			$server->pump(new TAsyncStream(new TH2Stream($server, 1)));   // a stream that owns no PHP resource
@@ -1863,7 +2189,13 @@ class TH2SessionTest extends PHPUnit\Framework\TestCase
 			self::assertSame('http2_pump_transport', $e->getErrorCode());
 		}
 		$clientSocket->close();
-		$transport->close();
+		$transport->close();                                   // the socket stream's resource is gone
+		try {
+			$server->pump($transport);
+			self::fail('A transport whose resource is closed did not throw.');
+		} catch (THttp2Exception $e) {
+			self::assertSame('http2_pump_transport', $e->getErrorCode());
+		}
 	}
 
 	public function testPumpRethrowsAHandlerThrowableAndStaysUsable()

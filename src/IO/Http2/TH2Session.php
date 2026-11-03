@@ -17,6 +17,7 @@ use Prado\IO\Async\TCancellationToken;
 use Prado\IO\IResource;
 use Prado\Prado;
 use Prado\TComponent;
+use Psr\Http\Message\StreamInterface;
 use Revolt\EventLoop\Suspension;
 
 /**
@@ -29,7 +30,7 @@ use Revolt\EventLoop\Suspension;
  * and flow control; this class bridges its callbacks to PHP.
  *
  * Server flow: advertise settings, feed received bytes, and handle {@see onRequest} for each
- * request stream — {@see respond()} accepts it with response headers (e.g. `:status` 200 for an
+ * request stream.  {@see respond()} accepts it with response headers (e.g. `:status` 200 for an
  * RFC 8441 Extended CONNECT) and the stream then carries DATA both ways.  Client flow:
  * {@see request()} opens a stream and {@see onResponse} delivers the response headers.
  *
@@ -53,17 +54,18 @@ use Revolt\EventLoop\Suspension;
  * The session is busy while nghttp2 executes a call on it.  {@see receive()} throws
  * `http2_session_busy` while any nghttp2 call on the session is in progress, and {@see send()}
  * throws it while another send() is in progress: a nested call would re-enter nghttp2's state
- * machine.  PHP permits a fiber switch inside an FFI callback, so a handler that waits on the
- * PRADO event loop (`TAsync::sleep()`, `TFuture::await()`, a `TAsyncStream` read) leaves nghttp2
- * mid-call while the loop runs, from the main fiber or from a suspended worker fiber, and the
- * loop's next receive() on the session is such a re-entry.  A handler that waits hands the work
- * to {@see \Prado\IO\Async\TAsync::run()} and returns; the fiber resumes from the loop outside
- * any nghttp2 call and may then respond, write, and end the stream.
+ * machine.  PHP permits a fiber switch inside an FFI callback.  A handler that waits on the PRADO
+ * event loop (`TAsync::sleep()`, `TFuture::await()`, a `TAsyncStream` read) therefore leaves
+ * nghttp2 mid-call while the loop runs, and the loop's next receive() on the session is such a
+ * re-entry.  A handler that waits hands the work to {@see \Prado\IO\Async\TAsync::run()} and
+ * returns; the fiber resumes from the loop outside any nghttp2 call and may then respond, write,
+ * and end the stream.
  *
- * {@see pump()} drives the session over a `TAsyncStream` transport on the loop: it flushes
- * {@see send()} to the transport, waits until the transport is readable or a submit queued
- * output, and feeds what it reads to {@see receive()}, until the peer closes the transport, the
- * session no longer wants I/O, or a cancellation token ends it.  Every submit ({@see respond()},
+ * {@see pump()} drives the session over a `TAsyncStream` transport on the loop: it drains
+ * {@see send()}, writes what the transport accepts, waits until the transport is readable, accepts
+ * more output, or a submit queued output, and feeds what it reads to {@see receive()}.  It returns
+ * once the session no longer wants I/O or a cancellation token ends it, and closes the session
+ * when the transport ends or a read or write on it fails.  Every submit ({@see respond()},
  * {@see resumeStream()} behind a stream write, {@see goaway()}, ...) wakes a waiting pump, so a
  * worker fiber's response reaches the wire without the caller flushing.
  *
@@ -169,6 +171,9 @@ class TH2Session extends TComponent
 
 	/** @var string The pump wake reason: the transport is readable. */
 	private const PUMP_READABLE = 'readable';
+
+	/** @var string The pump wake reason: the transport accepts more of the held output. */
+	private const PUMP_WRITABLE = 'writable';
 
 	/** @var string The pump wake reason: a submit queued output, or the session closed. */
 	private const PUMP_OUTPUT = 'output';
@@ -347,13 +352,19 @@ class TH2Session extends TComponent
 		$this->_nativeDepth = $value;
 	}
 
-	/** @return bool Whether a send() is draining nghttp2's output. */
+	/**
+	 * @return bool Whether a send() is draining nghttp2's output.
+	 * @since 1.3.0
+	 */
 	protected function getSendingDirect(): bool
 	{
 		return $this->_sending;
 	}
 
-	/** @param bool $value Whether a send() is draining nghttp2's output. */
+	/**
+	 * @param bool $value Whether a send() is draining nghttp2's output.
+	 * @since 1.3.0
+	 */
 	protected function setSendingDirect(bool $value): void
 	{
 		$this->_sending = $value;
@@ -397,7 +408,7 @@ class TH2Session extends TComponent
 
 	/**
 	 * @return bool Whether a fiber is inside {@see pump()}.
-	 * @since 1.2.1
+	 * @since 1.3.0
 	 */
 	protected function getPumpingDirect(): bool
 	{
@@ -406,7 +417,7 @@ class TH2Session extends TComponent
 
 	/**
 	 * @param bool $value Whether a fiber is inside {@see pump()}.
-	 * @since 1.2.1
+	 * @since 1.3.0
 	 */
 	protected function setPumpingDirect(bool $value): void
 	{
@@ -415,7 +426,7 @@ class TH2Session extends TComponent
 
 	/**
 	 * @return ?Suspension The pump's suspension while it waits, or null.
-	 * @since 1.2.1
+	 * @since 1.3.0
 	 */
 	protected function getPumpWaiterDirect(): ?Suspension
 	{
@@ -424,7 +435,7 @@ class TH2Session extends TComponent
 
 	/**
 	 * @param ?Suspension $value The pump's suspension while it waits, or null.
-	 * @since 1.2.1
+	 * @since 1.3.0
 	 */
 	protected function setPumpWaiterDirect(?Suspension $value): void
 	{
@@ -688,12 +699,13 @@ class TH2Session extends TComponent
 	/**
 	 * Returns the peer's remaining flow-control window for a stream: the DATA bytes nghttp2 may
 	 * still send on it before the peer's next WINDOW_UPDATE.  The connection window
-	 * ({@see getRemoteWindowSize()}) caps it as well.  A stream nghttp2 no longer has yields -1.
+	 * ({@see getRemoteWindowSize()}) caps it as well.  A stream nghttp2 does not have yields -1: a
+	 * {@see request()} whose HEADERS is not sent yet, or a stream that has closed.
 	 * {@see TH2Stream::writeAsync()} uses it as the default high-water mark.
 	 * @param int $streamId The stream identifier.
 	 * @throws THttp2Exception When the session is closed.
 	 * @return int The window in bytes, or -1 for an unknown stream.
-	 * @since 1.2.1
+	 * @since 1.3.0
 	 */
 	public function getStreamRemoteWindowSize(int $streamId): int
 	{
@@ -706,7 +718,7 @@ class TH2Session extends TComponent
 	 * may still send across all streams before the peer's next WINDOW_UPDATE on stream 0.
 	 * @throws THttp2Exception When the session is closed.
 	 * @return int The window in bytes.
-	 * @since 1.2.1
+	 * @since 1.3.0
 	 */
 	public function getRemoteWindowSize(): int
 	{
@@ -874,6 +886,7 @@ class TH2Session extends TComponent
 	 * @throws \Throwable The first Throwable an event handler or data provider raised while the
 	 *   bytes were produced; the session stays usable.
 	 * @return string The bytes to write to the transport ('' when none).
+	 * @phpstan-impure
 	 */
 	public function send(): string
 	{
@@ -979,19 +992,22 @@ class TH2Session extends TComponent
 	}
 
 	/**
-	 * Drives the session over a transport on the PRADO event loop.  Each round flushes {@see send()}
-	 * to the transport (a `TAsyncStream` write waits while the socket buffer is full), returns once
-	 * the session no longer {@see wantsIo() wants I/O} (a GOAWAY exchange has completed), otherwise
-	 * suspends the current fiber until the transport is readable or a submit queued output
+	 * Drives the session over a transport on the PRADO event loop.  Each round drains {@see send()}
+	 * and writes what the transport accepts at once (its stream is non-blocking); the rest is held
+	 * for the next round, so the pump keeps reading while the peer's socket buffer is full.  The
+	 * pump returns once nothing is held and the session no longer {@see wantsIo() wants I/O} (a
+	 * GOAWAY exchange has completed).  Otherwise it suspends the current fiber until the transport is
+	 * readable, the transport accepts more of the held output, or a submit queued output
 	 * ({@see respond()}, a {@see TH2Stream::write()} from another fiber, {@see goaway()}, ...), and
-	 * feeds what it reads to {@see receive()}.  End of stream on the transport, or a failed read (a
-	 * peer that resets the connection), closes the session; the caller closes the transport.  Event handlers run inside receive(); one that waits hands the
-	 * work to `TAsync::run()`, and that fiber's later respond or write wakes the pump.  Call it from
-	 * a worker fiber (`TAsync::run(fn () => $session->pump($transport))`), one per session, or from
-	 * the main fiber, where it runs the loop until it returns.  The transport's inner stream must own
-	 * an open PHP stream resource, such as a `TSocketStream`.  A Throwable an event handler raised
-	 * leaves the pump through receive() with the session still usable, so the pump can be called
-	 * again.
+	 * feeds what it reads to {@see receive()}.  End of stream on the transport, or a read or write
+	 * that fails (a peer that resets the connection), closes the session; the caller closes the
+	 * transport.  Event handlers run inside receive(); one that waits hands the work to
+	 * `TAsync::run()`, and that fiber's later respond or write wakes the pump.  Call it from a worker
+	 * fiber (`TAsync::run(fn () => $session->pump($transport))`), one per session, or from the main
+	 * fiber, where it runs the loop until it returns.  The transport's inner stream must own an open
+	 * PHP stream resource, such as a `TSocketStream`.  A Throwable an event handler raised, or a
+	 * cancelled token, leaves the pump with the session still usable and the held output kept for
+	 * the next {@see send()}, so the pump can be called again.
 	 * @param TAsyncStream $transport The transport over the connection.
 	 * @param ?TCancellationToken $token A token whose cancellation ends the pump; the session stays open.
 	 * @throws THttp2Exception `http2_pump_in_progress` when a fiber already pumps the session,
@@ -999,7 +1015,7 @@ class TH2Session extends TComponent
 	 *   when the session is closed, or an nghttp2 failure.
 	 * @throws TCancelledException When the token is cancelled.
 	 * @throws \Throwable What an event handler raised.
-	 * @since 1.2.1
+	 * @since 1.3.0
 	 */
 	public function pump(TAsyncStream $transport, ?TCancellationToken $token = null): void
 	{
@@ -1012,61 +1028,107 @@ class TH2Session extends TComponent
 			throw new THttp2Exception('http2_pump_transport');
 		}
 		$this->setPumpingDirect(true);
+		$held = '';   // output the transport has not accepted yet
 		try {
-			while (true) {
-				// Flush until nothing is left: a submit made while a write waited for the socket is
-				// picked up by the next send() rather than left for the next wake.
-				while (!$this->getClosedDirect()) {
-					$output = $this->send();
-					if ($output === '') {
-						break;
+			while (!$this->getClosedDirect()) {
+				// Drain nghttp2 in full: a submit made during a handler is picked up in this round.
+				while (!$this->getClosedDirect() && ($output = $this->send()) !== '') {
+					$held .= $output;
+				}
+				if ($held !== '') {
+					$held = $this->writeTransport($inner, $held);
+					if ($this->getClosedDirect()) {
+						return;   // the write failed: the connection is gone
 					}
-					$transport->write($output, $token);
 				}
-				if (!$this->wantsIo()) {
-					return;   // closed, or a GOAWAY exchange has completed
+				if ($held === '' && !$this->wantsIo()) {
+					return;   // a GOAWAY exchange has completed
 				}
-				if ($this->awaitTransport($inner, $token) !== self::PUMP_READABLE) {
-					continue;   // a submit queued output: flush it
+				if ($this->awaitTransport($inner, $held !== '', $token) !== self::PUMP_READABLE) {
+					continue;   // the transport accepts more output, or a submit queued some: write it
 				}
-				try {
-					$bytes = $inner->read(self::PUMP_READ_LENGTH);   // non-blocking: the loop reported it readable
-				} catch (\RuntimeException $e) {
-					$this->close();   // a failed read (a peer reset): the connection is gone
-					return;
+				$bytes = $this->readTransport($inner);
+				if ($bytes !== '') {
+					$this->receive($bytes);
 				}
-				if ($bytes === '') {
-					if ($inner->eof()) {
-						$this->close();   // end of stream: the peer is gone
-						return;
-					}
-					continue;   // readable without bytes (TLS bookkeeping): wait again
-				}
-				$this->receive($bytes);
 			}
 		} finally {
+			if ($held !== '' && !$this->getClosedDirect()) {
+				// Cancelled, or a handler threw: the next send() returns the held bytes first.
+				$this->setUnsentOutputDirect($held . $this->getUnsentOutputDirect());
+			}
 			$this->setPumpingDirect(false);
 		}
 	}
 
 	/**
-	 * Suspends the pump's fiber until the transport is readable, a submit queues output, the
-	 * session closes, or the token is cancelled.
+	 * Writes what the transport accepts now and returns the rest.  The transport's stream is
+	 * non-blocking (`TAsyncStream` sets it so), so a full socket buffer returns a short count.  A
+	 * write that throws closes the session: the peer reset the connection.  `fwrite()` reports that
+	 * as an E_NOTICE, which the PRADO error handler turns into a `TPhpErrorException` and the
+	 * stream otherwise turns into a `RuntimeException`.
+	 * @param IResource&StreamInterface $inner The transport's inner stream.
+	 * @param string $output The bytes to write.
+	 * @return string The bytes the transport did not accept ('' when all were written).
+	 * @phpstan-impure
+	 */
+	private function writeTransport(IResource&StreamInterface $inner, string $output): string
+	{
+		try {
+			$written = $inner->write($output);
+		} catch (\Exception $e) {
+			$this->close();
+			return '';
+		}
+		return $written >= strlen($output) ? '' : substr($output, $written);
+	}
+
+	/**
+	 * Reads what the transport has now.  The loop reported the transport readable, so a
+	 * non-blocking read returns at once: bytes, or '' with {@see StreamInterface::eof()} at end of
+	 * stream, or '' without it (TLS bookkeeping).  End of stream, or a read that throws (a peer
+	 * reset, which `fread()` reports as a failure without an E_NOTICE), closes the session.
+	 * @param IResource&StreamInterface $inner The transport's inner stream.
+	 * @return string The bytes read ('' when none, or when the session was closed).
+	 * @phpstan-impure
+	 */
+	private function readTransport(IResource&StreamInterface $inner): string
+	{
+		try {
+			$bytes = $inner->read(self::PUMP_READ_LENGTH);
+		} catch (\Exception $e) {
+			$this->close();   // a failed read (a peer reset): the connection is gone
+			return '';
+		}
+		if ($bytes === '' && $inner->eof()) {
+			$this->close();   // end of stream: the peer is gone
+		}
+		return $bytes;
+	}
+
+	/**
+	 * Suspends the pump's fiber until the transport is readable, the transport is writable (when
+	 * output is held), a submit queues output, the session closes, or the token is cancelled.
 	 * @param IResource $resource The transport's inner stream, owning the resource to watch.
+	 * @param bool $writable Whether to wake when the transport accepts output.
 	 * @param ?TCancellationToken $token A token whose cancellation ends the wait.
 	 * @throws TCancelledException When the token is cancelled.
-	 * @return string The wake reason: {@see PUMP_READABLE} or {@see PUMP_OUTPUT}.
+	 * @return string The wake reason: {@see PUMP_READABLE}, {@see PUMP_WRITABLE}, or {@see PUMP_OUTPUT}.
 	 */
-	private function awaitTransport(IResource $resource, ?TCancellationToken $token): string
+	private function awaitTransport(IResource $resource, bool $writable, ?TCancellationToken $token): string
 	{
 		$token?->throwIfCancelled();
 		$loop = TAsync::getLoop();
 		$suspension = $loop->suspension();
 		$this->setPumpWaiterDirect($suspension);
-		$watcher = $loop->onReadable($resource, function (string $id) use ($loop): void {
+		$ready = fn (string $reason): \Closure => function (string $id) use ($loop, $reason): void {
 			$loop->cancel($id);
-			$this->wakePump(self::PUMP_READABLE);
-		});
+			$this->wakePump($reason);
+		};
+		$watchers = [$loop->onReadable($resource, $ready(self::PUMP_READABLE))];
+		if ($writable) {
+			$watchers[] = $loop->onWritable($resource, $ready(self::PUMP_WRITABLE));
+		}
 		$subscription = $token?->subscribe(function (TCancelledException $reason) use ($suspension): void {
 			if ($this->getPumpWaiterDirect() === $suspension) {
 				$this->setPumpWaiterDirect(null);
@@ -1076,7 +1138,9 @@ class TH2Session extends TComponent
 		try {
 			return $suspension->suspend();
 		} finally {
-			$loop->cancel($watcher);
+			foreach ($watchers as $watcher) {
+				$loop->cancel($watcher);
+			}
 			if ($this->getPumpWaiterDirect() === $suspension) {
 				$this->setPumpWaiterDirect(null);
 			}
@@ -1089,7 +1153,7 @@ class TH2Session extends TComponent
 	/**
 	 * Resumes a waiting {@see pump()} with a reason.  The loop resumes it on its next iteration, so
 	 * a wake from inside an nghttp2 callback switches no fiber there.
-	 * @param string $reason {@see PUMP_READABLE} or {@see PUMP_OUTPUT}.
+	 * @param string $reason {@see PUMP_READABLE}, {@see PUMP_WRITABLE}, or {@see PUMP_OUTPUT}.
 	 */
 	private function wakePump(string $reason): void
 	{

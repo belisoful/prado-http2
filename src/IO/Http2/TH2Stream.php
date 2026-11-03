@@ -64,13 +64,22 @@ use Revolt\EventLoop\Suspension;
  */
 class TH2Stream extends TComponent implements StreamInterface
 {
-	/** @var string The wait kind of {@see waitReadable()}: incoming bytes or end of stream. */
+	/**
+	 * @var string The wait kind of {@see waitReadable()}: incoming bytes or end of stream.
+	 * @since 1.3.0
+	 */
 	public const WAIT_READ = 'read';
 
-	/** @var string The wait kind of {@see waitWritable()}: the outgoing queue at or below the high-water mark. */
+	/**
+	 * @var string The wait kind of {@see waitWritable()}: the outgoing queue at or below the high-water mark.
+	 * @since 1.3.0
+	 */
 	public const WAIT_WRITE = 'write';
 
-	/** @var string The wait kind of {@see awaitResponse()}: the final response headers. */
+	/**
+	 * @var string The wait kind of {@see awaitResponse()}: the final response headers.
+	 * @since 1.3.0
+	 */
 	public const WAIT_RESPONSE = 'response';
 
 	/** @var int The consumed prefix length at which a buffer is compacted (once it is at least half consumed). */
@@ -366,7 +375,7 @@ class TH2Stream extends TComponent implements StreamInterface
 	 * Returns the raw suspension of the fiber waiting for a condition.
 	 * @param string $kind The wait kind: {@see WAIT_READ}, {@see WAIT_WRITE}, or {@see WAIT_RESPONSE}.
 	 * @return ?Suspension The waiting fiber's suspension, or null when no fiber waits.
-	 * @since 1.2.1
+	 * @since 1.3.0
 	 */
 	protected function getWaiterDirect(string $kind = self::WAIT_READ): ?Suspension
 	{
@@ -377,7 +386,7 @@ class TH2Stream extends TComponent implements StreamInterface
 	 * Sets the raw suspension of the fiber waiting for a condition.
 	 * @param ?Suspension $value The waiting fiber's suspension, or null when no fiber waits.
 	 * @param string $kind The wait kind: {@see WAIT_READ}, {@see WAIT_WRITE}, or {@see WAIT_RESPONSE}.
-	 * @since 1.2.1
+	 * @since 1.3.0
 	 */
 	protected function setWaiterDirect(?Suspension $value, string $kind = self::WAIT_READ): void
 	{
@@ -391,7 +400,7 @@ class TH2Stream extends TComponent implements StreamInterface
 	/**
 	 * Returns the raw write high-water mark.
 	 * @return ?int The mark in bytes, or null for the peer's window.
-	 * @since 1.2.1
+	 * @since 1.3.0
 	 */
 	protected function getWriteHighWaterMarkDirect(): ?int
 	{
@@ -401,7 +410,7 @@ class TH2Stream extends TComponent implements StreamInterface
 	/**
 	 * Sets the raw write high-water mark.
 	 * @param ?int $value The mark in bytes, or null for the peer's window.
-	 * @since 1.2.1
+	 * @since 1.3.0
 	 */
 	protected function setWriteHighWaterMarkDirect(?int $value): void
 	{
@@ -439,7 +448,7 @@ class TH2Stream extends TComponent implements StreamInterface
 	 * client stream gains them when the server's final response arrives; a server stream never has
 	 * them.
 	 * @return bool Whether a final response `:status` is present.
-	 * @since 1.2.1
+	 * @since 1.3.0
 	 */
 	public function hasFinalResponse(): bool
 	{
@@ -452,7 +461,7 @@ class TH2Stream extends TComponent implements StreamInterface
 	 * peer's remaining flow-control window for the stream
 	 * ({@see TH2Session::getStreamRemoteWindowSize()}), so the queue holds what the peer can accept.
 	 * @return ?int The mark in bytes, or null for the peer's window.
-	 * @since 1.2.1
+	 * @since 1.3.0
 	 */
 	public function getWriteHighWaterMark(): ?int
 	{
@@ -463,7 +472,7 @@ class TH2Stream extends TComponent implements StreamInterface
 	 * Sets the queued outgoing byte count above which {@see writeAsync()} waits.  A negative value
 	 * is treated as zero.
 	 * @param ?int $value The mark in bytes, or null for the peer's window.
-	 * @since 1.2.1
+	 * @since 1.3.0
 	 */
 	public function setWriteHighWaterMark(?int $value): void
 	{
@@ -473,7 +482,7 @@ class TH2Stream extends TComponent implements StreamInterface
 	/**
 	 * Returns the number of outgoing bytes queued and not yet drained into DATA frames.
 	 * @return int The queued byte count.
-	 * @since 1.2.1
+	 * @since 1.3.0
 	 */
 	public function getOutgoingLength(): int
 	{
@@ -673,14 +682,14 @@ class TH2Stream extends TComponent implements StreamInterface
 	 * cancelled.  Call it from a fiber the loop resumes, such as one started with `TAsync::run()`
 	 * from an `onRequest` handler, never from inside a session event handler: a wait there leaves
 	 * nghttp2 mid-call and the loop's next `receive()` throws `http2_session_busy`.  One fiber waits
-	 * per stream.
+	 * to read per stream; a second concurrent read wait throws.
 	 * @param int $length The maximum number of bytes to return.
 	 * @param ?TCancellationToken $token A token whose cancellation ends the wait.
 	 * @throws TCancelledException When the token is cancelled while waiting.
 	 * @throws \RuntimeException When the stream is detached/closed, $length is negative, or another
 	 *   fiber already waits on the stream.
 	 * @return string The bytes read, or '' at end of stream.
-	 * @since 1.2.1
+	 * @since 1.3.0
 	 */
 	public function readAsync(int $length, ?TCancellationToken $token = null): string
 	{
@@ -704,7 +713,7 @@ class TH2Stream extends TComponent implements StreamInterface
 	 * @throws TCancelledException When the token is cancelled while waiting, or was cancelled before.
 	 * @throws \RuntimeException When the stream is detached/closed, or another fiber already waits
 	 *   on the stream.
-	 * @since 1.2.1
+	 * @since 1.3.0
 	 */
 	public function waitReadable(?TCancellationToken $token = null): void
 	{
@@ -737,7 +746,7 @@ class TH2Stream extends TComponent implements StreamInterface
 	 * @throws \RuntimeException When the stream is not writable (closed, detached, or local-closed),
 	 *   when it closes while the fiber waits, or when another fiber already waits to write.
 	 * @return int The number of bytes queued.
-	 * @since 1.2.1
+	 * @since 1.3.0
 	 */
 	public function writeAsync(string $string, ?TCancellationToken $token = null): int
 	{
@@ -754,7 +763,7 @@ class TH2Stream extends TComponent implements StreamInterface
 	 * @throws TCancelledException When the token is cancelled while waiting, or was cancelled before.
 	 * @throws \RuntimeException When the stream is not writable (closed, detached, or local-closed),
 	 *   when it closes while the fiber waits, or when another fiber already waits to write.
-	 * @since 1.2.1
+	 * @since 1.3.0
 	 */
 	public function waitWritable(?TCancellationToken $token = null): void
 	{
@@ -805,7 +814,7 @@ class TH2Stream extends TComponent implements StreamInterface
 	 * @throws \RuntimeException When the stream ends (reset, session close, or the peer finishing
 	 *   without one) before a final response, or another fiber already waits for it.
 	 * @return array<string, string> The headers, including the response pseudo-headers.
-	 * @since 1.2.1
+	 * @since 1.3.0
 	 */
 	public function awaitResponse(?TCancellationToken $token = null): array
 	{
@@ -906,7 +915,7 @@ class TH2Stream extends TComponent implements StreamInterface
 
 	/**
 	 * Returns up to $length buffered incoming bytes (non-blocking).  An open stream with nothing
-	 * buffered returns '' rather than blocking.
+	 * buffered returns '' at once.
 	 * @param int $length The maximum number of bytes to return.
 	 * @throws \RuntimeException When the stream is detached/closed, or $length is negative.
 	 * @return string The bytes read, or '' when none are buffered.

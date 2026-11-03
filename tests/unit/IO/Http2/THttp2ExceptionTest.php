@@ -29,8 +29,48 @@ class THttp2ExceptionTest extends PHPUnit\Framework\TestCase
 				$args[$i] = "arg$i";
 				$tokens['{' . $i . '}'] = "arg$i";
 			}
-			self::assertSame(strtr($pattern, $tokens), $formatter->format($args), "ICU formats $code differently from plain substitution; double an apostrophe next to a brace.");
+			self::assertSame($this->plainSubstitution($pattern, $tokens), $formatter->format($args), "ICU formats $code differently from plain substitution; quote a literal brace, and double an apostrophe next to a brace or a quoted brace.");
 		}
+	}
+
+	public function testQuotedPatternsFormatAsTheirUnquotedText()
+	{
+		if (!class_exists(\MessageFormatter::class)) {
+			$this->markTestSkipped('The intl extension (MessageFormatter) is not available.');
+		}
+		// The quoting a future message may need, checked the way the message file is checked.
+		$patterns = [
+			"it''s {0}" => "it's arg0",
+			"{0}'s" => "arg0's",
+			"''{0}''" => "'arg0'",
+			"'{0}' is {0}" => '{0} is arg0',
+			"'{'0'}' is {0}" => '{0} is arg0',
+			"a '{literal}' and {1}" => 'a {literal} and arg1',
+		];
+		foreach ($patterns as $pattern => $expected) {
+			$formatter = \MessageFormatter::create('en', $pattern);
+			self::assertNotNull($formatter, "$pattern is a valid ICU pattern.");
+			$tokens = ['{0}' => 'arg0', '{1}' => 'arg1'];
+			self::assertSame($expected, $formatter->format(['arg0', 'arg1']), "ICU formats $pattern as expected.");
+			self::assertSame($expected, $this->plainSubstitution($pattern, $tokens), "The plain reading of $pattern matches ICU.");
+		}
+	}
+
+	/**
+	 * Formats a pattern as plain substitution reads it, honoring ICU's quoting: a doubled
+	 * apostrophe is one apostrophe, a quoted section is literal text, and each `{n}` token outside
+	 * the quotes is replaced.
+	 * @param string $pattern The ICU pattern.
+	 * @param array<string, string> $tokens The `{n}` => value replacements.
+	 * @return string The formatted text.
+	 */
+	private function plainSubstitution(string $pattern, array $tokens): string
+	{
+		return preg_replace_callback(
+			"/''|'([^']*)'|([^']+)/",
+			static fn (array $m) => $m[0] === "''" ? "'" : (isset($m[2]) ? strtr($m[2], $tokens) : $m[1]),
+			$pattern
+		);
 	}
 
 	public function testExceptionFormatsItsMessageFromTheFile()

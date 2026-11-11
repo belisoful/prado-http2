@@ -3,7 +3,7 @@
 All notable changes to `belisoful/prado-http2` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.4.0] - 2026-11-10
 
 ### Security
 - A received header block had no size limit. nghttp2 does not bound the decoded size of a header block and treats `SETTINGS_MAX_HEADER_LIST_SIZE` as advisory, and HPACK lets one 4000-byte table entry be referenced by 1-byte indexes: 147 KB on the wire decoded to a single 574 MB header value. Under a 128 MB `memory_limit` that was a fatal error inside the FFI callback, so one unauthenticated request ended a server process and every connection it held. The session now counts each block's header list size (name length + value length + 32 per field, RFC 9113 §6.5.2). A block over the limit is dropped, its stream is reset (RST_STREAM INTERNAL_ERROR), and `onInvalidFrame` is raised with `error` `TNgHttp2::ERR_TEMPORAL_CALLBACK_FAILURE`; the session stays usable. The limit is 64 KiB by default and applies to request headers, response headers, and trailers.
@@ -135,6 +135,7 @@ All notable changes to `belisoful/prado-http2` are recorded here. The format fol
 ### Added
 - Initial release: `TNgHttp2` FFI binding over the system `libnghttp2`, `TH2Session` (server and client, memory I/O, shared callbacks), `TH2Stream` (duplex PSR-7 stream), `TH2Options`, `THttp2Exception`, in-process unit tests, and a `curl --http2-prior-knowledge` interoperability test.
 
+[1.4.0]: https://github.com/belisoful/prado-http2/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/belisoful/prado-http2/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/belisoful/prado-http2/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/belisoful/prado-http2/compare/v1.1.0...v1.2.0

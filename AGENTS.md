@@ -38,7 +38,7 @@
 ### Documentation Standards
 - Every public method has a PHPDoc block with `@param`/`@return`/`@throws` as applicable, plus at least one descriptive sentence.
 - Classes have a clear top docblock (what/why/how, an example where useful) with `@author` and `@since`.
-- `@since` names the release the change ships in: the version after the last tag (`git tag`), which CHANGELOG.md's `[Unreleased]` section becomes; never the last tag itself. After v1.3.0 that is `1.4.0`.
+- `@since` names the release the change ships in: the version after the last tag (`git tag`), which CHANGELOG.md's `[Unreleased]` section becomes; never the last tag itself. After v1.4.0 that is `1.4.1` for a fix and `1.5.0` once the change adds API.
 - Docblocks are technical, present tense, American English. Banned: antithesis ("not X, it Ys"), em-dash dramatic asides, editorializing/filler, rule-of-three lists. One fact per sentence; prefer subject-verb-object and `condition → result`.
 
 ### Error Handling

@@ -4,7 +4,7 @@ This file provides guidance to Agents when working with code in this repository.
 
 ## What This Is
 
-**prado-http2** is a PRADO 4 extension that adds **HTTP/2** ([RFC 9113](https://www.rfc-editor.org/rfc/rfc9113.html)) to the [PRADO framework](https://github.com/pradosoft/prado) by binding the system **`libnghttp2`** through PHP **FFI**. nghttp2 owns the wire framing, HPACK header compression, stream state machine, and flow control; this extension is the PHP surface over it. All source lives under `src/` (PSR-4 namespace `Prado\IO\Http2`). Tests mirror that under `tests/unit/` and `tests/functional/`. Current version: **1.4.0** (see `CHANGELOG.md`).
+**prado-http2** is a PRADO 4 extension that adds **HTTP/2** ([RFC 9113](https://www.rfc-editor.org/rfc/rfc9113.html)) to the [PRADO framework](https://github.com/pradosoft/prado) by binding the system **`libnghttp2`** through PHP **FFI**. nghttp2 owns the wire framing, HPACK header compression, stream state machine, and flow control; this extension is the PHP surface over it. All source lives under `src/` (PSR-4 namespace `Prado\IO\Http2`). Tests mirror that under `tests/unit/` and `tests/functional/`. Current version: **1.5.0** (see `CHANGELOG.md`).
 
 It is **general** HTTP/2 — the basis for HTTP/2 servers, clients, and [RFC 8441](https://www.rfc-editor.org/rfc/rfc8441.html) WebSocket-over-HTTP/2 multiplexing. The `prado-websocket` extension consumes it as an **optional** dependency.
 
@@ -102,7 +102,7 @@ The extension has no bootstrap module. `config/errorMessages.txt` (the `http2_*`
 - **The cdef mirrors `nghttp2.h` exactly.** `nghttp2_ssize` is `ptrdiff_t` (a `long` is 32-bit on Windows) and struct fields keep the header's order (`nghttp2_info` is `age, version_num, version_str, proto_str`). `TNgHttp2Test::testVersionInfoLayoutMatchesLibrary` cross-checks the layout at runtime.
 - **cs-fixer = tabs** (`@PSR12` + `setIndent("\t")`). If cs-fixer suddenly wants to convert tabs → spaces across *every* file, `.php-cs-fixer.dist.php` has been clobbered by a php-cs-fixer scaffold (the `@auto` default); restore the tab-based config (it matches the sibling extensions).
 - **`if` statements** always use a block (`{}`), never a single-line body.
-- **`@since`** names the release the change ships in: the version after the last tag (`git tag`), which CHANGELOG.md's `[Unreleased]` section becomes; never the last tag itself. After v1.4.0 that is `1.4.1` for a fix and `1.5.0` once the change adds API; `[Unreleased]` now adds API, so new members are `@since 1.5.0`. Omit the method tag when it matches the class.
+- **`@since`** names the release the change ships in: the version after the last tag (`git tag`), which CHANGELOG.md's `[Unreleased]` section becomes; never the last tag itself. After v1.5.0 that is `1.5.1` for a fix and `1.6.0` once the change adds API. Omit the method tag when it matches the class.
 - **Backward compatibility** — all changes must be backward compatible within a point release.
 - Method docblocks are **tight** and carry at least one descriptive sentence (not only `@param`/`@return`).
 

@@ -32,7 +32,8 @@ use Prado\TComponent;
  * header list limit.  Under automatic flow control nghttp2 reopens the window as DATA arrives, so
  * a stream buffers whatever the peer sends until the application reads it.  The local maximum
  * concurrent streams is a SETTING, set with {@see TH2Session::submitSettings()} using
- * {@see TNgHttp2::SETTINGS_MAX_CONCURRENT_STREAMS}.
+ * {@see TNgHttp2::SETTINGS_MAX_CONCURRENT_STREAMS}; a server advertises
+ * {@see TH2Session::DEFAULT_MAX_CONCURRENT_STREAMS} when the caller gives none.
  *
  * @author Brad Anderson <belisoful@icloud.com>
  * @since 0.9.0

@@ -127,6 +127,17 @@ $session->receive($transport->read(65536));
 
 A finite body is finished two ways: `markLocalClosed()` flushes the queued bytes and ends the stream (END_STREAM), and `sendTrailers([...])` flushes the body and then ends the stream with a trailing header block (HTTP/2 trailers, e.g. `grpc-status`). `close()` discards the buffers, detaches the stream, and ends it on the wire: a peer still sending is cancelled (RST_STREAM CANCEL), and so is a request the server never answered with `respond()`; otherwise a peer that has finished sees END_STREAM. Once nghttp2 closes a stream (peer reset, completion, or session close) both directions are marked closed: buffered bytes stay readable and a write throws.
 
+A server may answer before the client has sent its whole request (a `413`, a redirect, a WebSocket close). `markLocalClosed()` alone ends the response and leaves the stream open until the client ends its side, and `close()` would discard the queued response. `setResetAfterEnd(true)` covers this case: the queued bytes, the trailers, and END_STREAM are sent first, then RST_STREAM with NO_ERROR tells the client to stop sending (RFC 9113 §8.1), and the session forgets the stream. No reset is sent when the client has finished by then.
+
+```php
+$session->respond($stream, [':status' => '413']);
+$stream->write('Payload too large');
+$stream->setResetAfterEnd(true);                 // after END_STREAM: RST_STREAM NO_ERROR while the client still sends
+$stream->markLocalClosed();
+```
+
+`isLocalClosed()` and `isRemoteClosed()` report each direction: this side has finished writing, and the peer has finished sending. `eof()` is true once the peer has finished and the buffer is read. `hasEndStreamSent()` is true once this side's END_STREAM frame has left `send()`.
+
 Trailers flow both ways: `onTrailers` fires on the server for request trailers and on the client for response trailers. Header names are lowercased on submit (RFC 9113 §8.2.1). A name that is not a token (one leading colon marks a pseudo-header) and a value with a CR, LF, or NUL character throw `http2_header_invalid`: nghttp2 would send them, and a peer drops such a field without notice or rejects the message. A received field that repeats keeps every value: `cookie` crumbs rejoin with `; ` and any other name combines with `, `.
 
 ### Connection control and tuning
@@ -161,10 +172,10 @@ Diagnostic events `onFrameSent`/`onFrameNotSent`/`onInvalidFrame`/`onSessionErro
 
 ### Limits and flow control
 
-A session that faces untrusted peers needs three bounds. The first is on by default; the other two are the application's choice.
+A session that faces untrusted peers needs three bounds. The first two are on by default; the third is the application's choice.
 
 - **Header size.** nghttp2 does not bound the decoded size of a header block, and `SETTINGS_MAX_HEADER_LIST_SIZE` is advisory. HPACK lets 147 KB on the wire decode to a 574 MB header list. The session enforces a limit itself: a block whose header list (name length + value length + 32 per field, RFC 9113 §6.5.2) passes `getMaxHeaderListSize()` is dropped, its stream is reset, and `onInvalidFrame` is raised. The limit is 64 KiB (`TH2Session::DEFAULT_MAX_HEADER_LIST_SIZE`) unless `TH2Options::setMaxHeaderListSize($bytes)` sets another; `0` turns it off. `submitSettings()` advertises it.
-- **Concurrent streams.** nghttp2 accepts any number of streams until the session says otherwise. A server submits `TNgHttp2::SETTINGS_MAX_CONCURRENT_STREAMS` (100 is a common value) with its settings.
+- **Concurrent streams.** nghttp2 accepts any number of streams until the session says otherwise. A server's `submitSettings()` advertises `TNgHttp2::SETTINGS_MAX_CONCURRENT_STREAMS` of 100 (`TH2Session::DEFAULT_MAX_CONCURRENT_STREAMS`) unless the caller gives that id. A client that follows the limit holds further requests back. nghttp2 enforces it: a stream over the limit raises `onInvalidFrame` and no `onRequest`, and is refused (RST_STREAM REFUSED_STREAM) while the client has not acknowledged the SETTINGS and ends the connection (GOAWAY PROTOCOL_ERROR) once it has. A stream counts until both sides have ended it, so a response that ends while the client still sends keeps its place: `TH2Stream::setResetAfterEnd(true)` releases it.
 - **Body buffering.** Under automatic flow control (the default) nghttp2 reopens the peer's window as DATA arrives, so a stream buffers whatever the peer sends until the application reads it: a body nobody reads, or one read slower than it arrives, grows without limit. `TH2Options::setConsumeOnRead(true)` reopens the window as the application reads instead (`read()`, `getContents()`, `readAsync()`), so a stream buffers at most the window (64 KiB by default) and the peer waits. Bytes left unread when a stream closes, or when the application closes it, go back to the connection window, so one abandoned stream cannot stall the others. While a stream holds unread bytes it also holds that much of the connection window; raise the connection window with `submitWindowUpdate(0, $increment)` when many streams upload at once.
 
 ```php
@@ -172,7 +183,7 @@ $options = new TH2Options();
 $options->setConsumeOnRead(true);                // the peer's window follows the application's reads
 $options->setMaxHeaderListSize(16384);           // optional: tighter than the 64 KiB default
 $session = new TH2Session(true, $options);
-$session->submitSettings([TNgHttp2::SETTINGS_MAX_CONCURRENT_STREAMS => 100]);
+$session->submitSettings([TNgHttp2::SETTINGS_MAX_CONCURRENT_STREAMS => 250]);   // optional: the default is 100
 ```
 
 `TH2Options::setNoAutoWindowUpdate(true)` alone leaves the accounting to the application: it calls `consume($streamId, $bytes)` for what it has processed, including the bytes still buffered on a stream it closes (`TH2Stream::getIncomingLength()` is that count). Do not call `consume()` under `ConsumeOnRead`.

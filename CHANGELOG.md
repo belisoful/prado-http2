@@ -3,6 +3,20 @@
 All notable changes to `belisoful/prado-http2` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- `TH2Stream::setResetAfterEnd(true)` / `getResetAfterEnd()`: end a stream after a complete response while the peer still sends. The queued bytes, the trailers, and END_STREAM are sent first; the session then submits RST_STREAM with NO_ERROR (RFC 9113 §8.1), nghttp2 closes the stream, and `onClose` is raised. `markLocalClosed()` alone leaves such a stream in the session until the peer ends it, and `close()` discards the queued bytes. No reset is sent when the peer has finished by the time END_STREAM goes out. Set after END_STREAM was sent, the reset is submitted at once.
+- `TH2Stream::hasEndStreamSent()` and `markEndStreamSent()`: whether the frame that ends this side (DATA or trailing HEADERS with END_STREAM) has left `send()`.
+- `TH2Stream::isRemoteClosed()`: whether the peer has finished sending. `eof()` also needs the buffer read.
+- `TH2Session::DEFAULT_MAX_CONCURRENT_STREAMS` (100).
+
+### Changed
+- A server's `submitSettings()` advertises `SETTINGS_MAX_CONCURRENT_STREAMS => 100` unless the caller gives that id. nghttp2's default is no limit: a client could open any number of streams, and each one a server had answered and ended stayed in the session until the client ended it (20,000 such streams were observed in one session). nghttp2 enforces the advertised limit: a stream over it raises `onInvalidFrame` and no `onRequest`, is refused (RST_STREAM REFUSED_STREAM) until the client has acknowledged the SETTINGS, and ends the connection (GOAWAY PROTOCOL_ERROR) after that.
+
+### Upgrading
+- A server that relied on more than 100 concurrent streams per connection passes its own `TNgHttp2::SETTINGS_MAX_CONCURRENT_STREAMS` to `submitSettings()`. A client that follows the limit queues the requests over it, so they wait where they used to run at once.
+
 ## [1.4.0] - 2026-11-10
 
 ### Security
@@ -135,6 +149,7 @@ All notable changes to `belisoful/prado-http2` are recorded here. The format fol
 ### Added
 - Initial release: `TNgHttp2` FFI binding over the system `libnghttp2`, `TH2Session` (server and client, memory I/O, shared callbacks), `TH2Stream` (duplex PSR-7 stream), `TH2Options`, `THttp2Exception`, in-process unit tests, and a `curl --http2-prior-knowledge` interoperability test.
 
+[Unreleased]: https://github.com/belisoful/prado-http2/compare/v1.4.0...HEAD
 [1.4.0]: https://github.com/belisoful/prado-http2/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/belisoful/prado-http2/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/belisoful/prado-http2/compare/v1.2.0...v1.2.1

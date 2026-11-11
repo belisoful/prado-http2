@@ -32,7 +32,10 @@ use Revolt\EventLoop\Suspension;
  * drained.  {@see markLocalClosed()} finishes a finite body: the queued bytes flush and the
  * stream then ends (END_STREAM).  {@see close()} discards the buffers, detaches the stream, and
  * ends it on the wire: a peer that is still sending, and a request this server never answered, are
- * cancelled (RST_STREAM CANCEL); otherwise this side ends (END_STREAM).  Once nghttp2 closes the stream (peer reset, completion, or
+ * cancelled (RST_STREAM CANCEL); otherwise this side ends (END_STREAM).
+ * {@see setResetAfterEnd() ResetAfterEnd} ends the stream after a complete response while the peer
+ * still sends: the queued bytes and END_STREAM go out, then RST_STREAM NO_ERROR stops the peer.
+ * Once nghttp2 closes the stream (peer reset, completion, or
  * session close) the session marks both directions closed: buffered bytes stay readable, a write
  * throws.  A {@see read()}, {@see getContents()}, or {@see write()} on a detached stream throws,
  * per PSR-7.
@@ -144,6 +147,12 @@ class TH2Stream extends TComponent implements StreamInterface
 
 	/** @var bool Whether the buffered incoming bytes were already reported to the session as consumed. */
 	private bool $_incomingReleased = false;
+
+	/** @var bool Whether the frame that ends this side (END_STREAM) was sent. */
+	private bool $_endStreamSent = false;
+
+	/** @var bool Whether the stream is reset (NO_ERROR) once this side has ended and the peer still sends. */
+	private bool $_resetAfterEnd = false;
 
 	/**
 	 * Creates the stream of one HTTP/2 stream id on a session.
@@ -479,6 +488,46 @@ class TH2Stream extends TComponent implements StreamInterface
 		$this->_incomingReleased = $value;
 	}
 
+	/**
+	 * Returns the raw end-stream-sent flag.
+	 * @return bool Whether the frame that ends this side was sent.
+	 * @since 1.5.0
+	 */
+	protected function getEndStreamSentDirect(): bool
+	{
+		return $this->_endStreamSent;
+	}
+
+	/**
+	 * Sets the raw end-stream-sent flag.
+	 * @param bool $value Whether the frame that ends this side was sent.
+	 * @since 1.5.0
+	 */
+	protected function setEndStreamSentDirect(bool $value): void
+	{
+		$this->_endStreamSent = $value;
+	}
+
+	/**
+	 * Returns the raw reset-after-end flag.
+	 * @return bool Whether the stream is reset once this side has ended and the peer still sends.
+	 * @since 1.5.0
+	 */
+	protected function getResetAfterEndDirect(): bool
+	{
+		return $this->_resetAfterEnd;
+	}
+
+	/**
+	 * Sets the raw reset-after-end flag.
+	 * @param bool $value Whether the stream is reset once this side has ended and the peer still sends.
+	 * @since 1.5.0
+	 */
+	protected function setResetAfterEndDirect(bool $value): void
+	{
+		$this->_resetAfterEnd = $value;
+	}
+
 	// =========================================================================
 	// Properties
 	// =========================================================================
@@ -579,6 +628,46 @@ class TH2Stream extends TComponent implements StreamInterface
 		return $this->getHeadersSubmittedDirect();
 	}
 
+	/**
+	 * Indicates whether the frame that ends this side was sent: a DATA or trailing HEADERS frame with
+	 * END_STREAM left {@see TH2Session::send()}.  {@see isLocalClosed()} is true earlier, from the
+	 * moment the application finishes writing.
+	 * @return bool Whether this side's END_STREAM frame was sent.
+	 * @since 1.5.0
+	 */
+	public function hasEndStreamSent(): bool
+	{
+		return $this->getEndStreamSentDirect();
+	}
+
+	/**
+	 * Indicates whether the stream is reset once this side has ended and the peer still sends.
+	 * @return bool Whether the stream is reset after this side's END_STREAM frame.
+	 * @since 1.5.0
+	 */
+	public function getResetAfterEnd(): bool
+	{
+		return $this->getResetAfterEndDirect();
+	}
+
+	/**
+	 * Sets whether the stream is reset once this side has ended and the peer still sends.  When true,
+	 * the session submits RST_STREAM with NO_ERROR right after this side's END_STREAM frame is sent,
+	 * unless the peer has finished by then (RFC 9113 §8.1: a server that sent a complete response
+	 * asks the client to stop sending the request).  Every queued byte and the trailers are sent
+	 * first, which {@see close()} does not do.  nghttp2 then closes the stream, so
+	 * {@see TH2Session::onClose} is raised and the session forgets it without waiting for the peer.
+	 * Set after the END_STREAM frame was sent, the reset is submitted at once.  On a client stream the
+	 * reset discards the response.
+	 * @param bool $value Whether to reset the stream after this side's END_STREAM frame.
+	 * @since 1.5.0
+	 */
+	public function setResetAfterEnd(bool $value): void
+	{
+		$this->setResetAfterEndDirect($value);
+		$this->resetIfEnded();
+	}
+
 	// =========================================================================
 	// Session Plumbing
 	// =========================================================================
@@ -673,6 +762,17 @@ class TH2Stream extends TComponent implements StreamInterface
 	}
 
 	/**
+	 * Indicates whether the peer has finished sending: it ended the stream (END_STREAM), or the
+	 * stream closed.  Bytes may still be buffered; {@see eof()} is true once they are read as well.
+	 * @return bool Whether the peer has finished sending.
+	 * @since 1.5.0
+	 */
+	public function isRemoteClosed(): bool
+	{
+		return $this->getRemoteClosedDirect();
+	}
+
+	/**
 	 * Marks the peer as half-closed; no further incoming DATA arrives.  Wakes a waiting
 	 * {@see readAsync()} and {@see awaitResponse()}.
 	 */
@@ -707,6 +807,31 @@ class TH2Stream extends TComponent implements StreamInterface
 	public function markHeadersSubmitted(): void
 	{
 		$this->setHeadersSubmittedDirect(true);
+	}
+
+	/**
+	 * Marks the frame that ends this side as sent, and resets the stream when
+	 * {@see setResetAfterEnd() ResetAfterEnd} asks for it.  Called by {@see TH2Session} from nghttp2's
+	 * frame-sent callback for a DATA or HEADERS frame with END_STREAM.
+	 * @since 1.5.0
+	 */
+	public function markEndStreamSent(): void
+	{
+		$this->setEndStreamSentDirect(true);
+		$this->resetIfEnded();
+	}
+
+	/**
+	 * Submits RST_STREAM with NO_ERROR when {@see setResetAfterEnd() ResetAfterEnd} is set, this
+	 * side's END_STREAM frame was sent, and the peer has not finished.  A stream that closed counts
+	 * as finished, so the reset is submitted at most once and never on a closed session.
+	 * @since 1.5.0
+	 */
+	private function resetIfEnded(): void
+	{
+		if ($this->getResetAfterEndDirect() && $this->getEndStreamSentDirect() && !$this->getRemoteClosedDirect()) {
+			$this->getSessionDirect()->resetStream($this->getStreamIdDirect(), TNgHttp2::NO_ERROR);
+		}
 	}
 
 	/**

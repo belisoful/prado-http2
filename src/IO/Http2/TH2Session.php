@@ -46,7 +46,10 @@ use Revolt\EventLoop\Suspension;
  * reset: nghttp2 does not bound the decoded size of a header block.  A client session declines
  * server push (`SETTINGS_ENABLE_PUSH => 0`) when it {@see submitSettings() submits settings},
  * unless the caller sets that id; a pushed stream has no {@see TH2Stream}, so its frames are
- * discarded.  {@see close()} frees the nghttp2 session and raises {@see onClose} for the streams
+ * discarded.  A server session advertises `SETTINGS_MAX_CONCURRENT_STREAMS` of
+ * {@see DEFAULT_MAX_CONCURRENT_STREAMS} the same way.  A stream counts against that limit until
+ * both sides have ended it; {@see TH2Stream::setResetAfterEnd()} ends one whose response is
+ * complete while the client still sends.  {@see close()} frees the nghttp2 session and raises {@see onClose} for the streams
  * still open; every later nghttp2 call throws `http2_session_closed`.
  *
  * Flow control is nghttp2's by default: it reopens the peer's window as DATA arrives, so a stream
@@ -115,6 +118,13 @@ class TH2Session extends TComponent
 	 * @since 1.4.0
 	 */
 	public const DEFAULT_MAX_HEADER_LIST_SIZE = 65536;
+
+	/**
+	 * @var int The `SETTINGS_MAX_CONCURRENT_STREAMS` value a server advertises when the caller of
+	 *   {@see submitSettings()} gives none: the streams a client may have open at once.
+	 * @since 1.5.0
+	 */
+	public const DEFAULT_MAX_CONCURRENT_STREAMS = 100;
 
 	/** @var ?\FFI\CData The nghttp2 callbacks, built once and shared by all sessions. */
 	private static ?\FFI\CData $_callbacks = null;
@@ -676,7 +686,7 @@ class TH2Session extends TComponent
 		$onFrameSend = static function ($session, $frame, $userData) use ($ffi) {
 			$self = self::fromUserData($ffi, $userData);
 			$info = self::frameInfo($frame);
-			return $self === null ? 0 : $self->guarded(fn () => $self->onFrameSent($info));
+			return $self === null ? 0 : $self->guarded(fn () => $self->handleFrameSent($info));
 		};
 		$onFrameNotSend = static function ($session, $frame, $libError, $userData) use ($ffi) {
 			$self = self::fromUserData($ffi, $userData);
@@ -800,7 +810,12 @@ class TH2Session extends TComponent
 
 	/**
 	 * Submits connection SETTINGS (e.g. {@see TNgHttp2::SETTINGS_ENABLE_CONNECT_PROTOCOL}).  A client
-	 * adds `SETTINGS_ENABLE_PUSH => 0` unless the caller gives that id.  The session's
+	 * adds `SETTINGS_ENABLE_PUSH => 0` unless the caller gives that id.  A server adds
+	 * `SETTINGS_MAX_CONCURRENT_STREAMS => ` {@see DEFAULT_MAX_CONCURRENT_STREAMS} unless the caller
+	 * gives that id: nghttp2's own default is no limit, so a client could hold any number of streams
+	 * open.  nghttp2 enforces the limit: a request over it raises {@see onInvalidFrame} and no
+	 * {@see onRequest}, is refused (RST_STREAM REFUSED_STREAM) until the client has acknowledged the
+	 * SETTINGS, and ends the connection (GOAWAY PROTOCOL_ERROR) after that.  The session's
 	 * {@see getMaxHeaderListSize() header list limit} is advertised as `SETTINGS_MAX_HEADER_LIST_SIZE`
 	 * unless the caller gives that id or the limit is off.  The advertised value is advisory to the
 	 * peer; the limit this session enforces comes from {@see TH2Options::setMaxHeaderListSize()}.
@@ -813,6 +828,9 @@ class TH2Session extends TComponent
 		if (!$this->getIsServerDirect() && !array_key_exists(TNgHttp2::SETTINGS_ENABLE_PUSH, $settings)) {
 			// A pushed stream has no TH2Stream and is discarded, so a client declines push (RFC 9113 §8.4).
 			$settings[TNgHttp2::SETTINGS_ENABLE_PUSH] = 0;
+		}
+		if ($this->getIsServerDirect() && !array_key_exists(TNgHttp2::SETTINGS_MAX_CONCURRENT_STREAMS, $settings)) {
+			$settings[TNgHttp2::SETTINGS_MAX_CONCURRENT_STREAMS] = self::DEFAULT_MAX_CONCURRENT_STREAMS;
 		}
 		$limit = $this->getMaxHeaderListSize();
 		if ($limit > 0 && !array_key_exists(TNgHttp2::SETTINGS_MAX_HEADER_LIST_SIZE, $settings)) {
@@ -1721,6 +1739,23 @@ class TH2Session extends TComponent
 			$this->onData($stream);
 		}
 		return 0;
+	}
+
+	/**
+	 * Handles a sent frame.  A DATA or HEADERS frame with END_STREAM ends this side of its stream:
+	 * the stream is told ({@see TH2Stream::markEndStreamSent()}), which submits the RST_STREAM of a
+	 * stream set to {@see TH2Stream::setResetAfterEnd() reset after its end}.  {@see onFrameSent} is
+	 * raised after it.
+	 * @param array{type: int, streamId: int, flags: int} $info The frame summary.
+	 * @since 1.5.0
+	 */
+	private function handleFrameSent(array $info): void
+	{
+		if (($info['flags'] & TNgHttp2::FLAG_END_STREAM) !== 0
+			&& ($info['type'] === TNgHttp2::FRAME_DATA || $info['type'] === TNgHttp2::FRAME_HEADERS)) {
+			($this->getStreamsDirect()[$info['streamId']] ?? null)?->markEndStreamSent();
+		}
+		$this->onFrameSent($info);
 	}
 
 	/**

@@ -340,6 +340,84 @@ class TH2StreamTest extends PHPUnit\Framework\TestCase
 		$stream->close();                                      // idempotent: no second reset
 	}
 
+	public function testIsRemoteClosedTurnsTrueBeforeEof()
+	{
+		$stream = $this->stream();
+		self::assertFalse($stream->isRemoteClosed());
+		$stream->pushIncoming('tail');
+		$stream->markRemoteClosed();
+		self::assertTrue($stream->isRemoteClosed(), 'The peer has finished sending.');
+		self::assertFalse($stream->eof(), 'Bytes are still buffered.');
+		self::assertFalse($stream->isLocalClosed());
+		$stream->getContents();
+		self::assertTrue($stream->eof());
+
+		$closed = $this->stream();
+		$closed->markClosed();
+		self::assertTrue($closed->isRemoteClosed(), 'A closed stream receives nothing more.');
+		$detached = $this->stream();
+		$detached->close();
+		self::assertTrue($detached->isRemoteClosed());
+	}
+
+	public function testEndStreamSentWithoutResetAfterEndSubmitsNothing()
+	{
+		$session = $this->createMock(TH2Session::class);
+		$session->expects(self::never())->method('resetStream');
+		$stream = new TH2Stream($session, 5, []);
+		self::assertFalse($stream->getResetAfterEnd());
+		self::assertFalse($stream->hasEndStreamSent());
+		$stream->markEndStreamSent();
+		self::assertTrue($stream->hasEndStreamSent());
+		$stream->setResetAfterEnd(false);
+		self::assertFalse($stream->getResetAfterEnd());
+	}
+
+	public function testResetAfterEndResetsWithNoErrorOnceTheEndIsSent()
+	{
+		$resets = [];
+		$session = $this->createMock(TH2Session::class);
+		$session->method('resetStream')->willReturnCallback(function (int $id, int $code) use (&$resets) {
+			$resets[] = [$id, $code];
+		});
+		$stream = new TH2Stream($session, 5, []);
+		$stream->setResetAfterEnd(true);
+		self::assertTrue($stream->getResetAfterEnd());
+		$stream->markLocalClosed();
+		self::assertSame([], $resets, 'The END_STREAM frame is not sent yet: a reset now would cancel the response.');
+		$stream->markEndStreamSent();
+		self::assertSame([[5, \Prado\IO\Http2\TNgHttp2::NO_ERROR]], $resets);
+	}
+
+	public function testResetAfterEndSetAfterTheEndWasSentResetsAtOnce()
+	{
+		$resets = [];
+		$session = $this->createMock(TH2Session::class);
+		$session->method('resetStream')->willReturnCallback(function (int $id, int $code) use (&$resets) {
+			$resets[] = [$id, $code];
+		});
+		$stream = new TH2Stream($session, 7, []);
+		$stream->markEndStreamSent();
+		self::assertSame([], $resets);
+		$stream->setResetAfterEnd(true);
+		self::assertSame([[7, \Prado\IO\Http2\TNgHttp2::NO_ERROR]], $resets);
+	}
+
+	public function testResetAfterEndSubmitsNothingWhenThePeerHasFinished()
+	{
+		$session = $this->createMock(TH2Session::class);
+		$session->expects(self::never())->method('resetStream');
+		$finished = new TH2Stream($session, 5, []);
+		$finished->setResetAfterEnd(true);
+		$finished->markRemoteClosed();                         // the peer ended its side first
+		$finished->markEndStreamSent();
+
+		$closed = new TH2Stream($session, 7, []);
+		$closed->markEndStreamSent();
+		$closed->markClosed();                                 // nghttp2 closed the stream
+		$closed->setResetAfterEnd(true);
+	}
+
 	public function testHeadersSubmittedIsSetOnce()
 	{
 		$stream = $this->stream();

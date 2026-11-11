@@ -2882,12 +2882,386 @@ class TH2SessionTest extends PHPUnit\Framework\TestCase
 		$server->goaway();                                     // the session wants no more I/O once the GOAWAY is drained
 		$pump->await();
 		self::assertSame([TNgHttp2::FRAME_SETTINGS, TNgHttp2::FRAME_GOAWAY], $this->frameTypes($throttled->written));
-		self::assertSame(9 + 6 + 9 + 8, strlen($throttled->written), 'The pump wrote the whole GOAWAY before it returned.');
+		self::assertSame(9 + 12 + 9 + 8, strlen($throttled->written), 'The pump wrote the whole GOAWAY before it returned.');
 		self::assertSame($throttled->written, $clientSocket->read(65536));
 		self::assertSame('', $server->send(), 'Nothing was left held.');
 		$server->close();
 		$clientSocket->close();
 		$transport->close();
+	}
+
+	public function testServerAdvertisesADefaultConcurrentStreamLimit()
+	{
+		[$server, $client] = $this->newPair();
+		self::assertSame(100, TH2Session::DEFAULT_MAX_CONCURRENT_STREAMS);
+		$this->pump($server, $client, 2);
+		self::assertSame(100, $client->getRemoteSetting(TNgHttp2::SETTINGS_MAX_CONCURRENT_STREAMS), 'The server advertised the default limit.');
+		self::assertSame(0xFFFFFFFF, $server->getRemoteSetting(TNgHttp2::SETTINGS_MAX_CONCURRENT_STREAMS), 'A client advertises none: it declines push.');
+		$server->close();
+		$client->close();
+
+		$server = new TH2Session(true);
+		$client = new TH2Session(false);
+		$server->submitSettings([TNgHttp2::SETTINGS_MAX_CONCURRENT_STREAMS => 7]);   // the caller's value is sent as given
+		$client->submitSettings([]);
+		$this->pump($server, $client, 2);
+		self::assertSame(7, $client->getRemoteSetting(TNgHttp2::SETTINGS_MAX_CONCURRENT_STREAMS));
+		$server->close();
+		$client->close();
+	}
+
+	public function testAClientHoldsRequestsOverTheServersDefaultLimit()
+	{
+		[$server, $client] = $this->newPair();
+		$this->pump($server, $client, 2);                      // the client learns the limit
+		$requests = 0;
+		$server->attachEventHandler('onRequest', function ($s, $stream) use ($server, &$requests) {
+			$requests++;
+			$server->respond($stream, [':status' => '200']);
+			$stream->markLocalClosed();                        // answered and ended; the client has not ended its side
+		});
+		$streams = [];
+		for ($i = 0; $i < 150; $i++) {
+			$streams[] = $client->request([':method' => 'POST', ':scheme' => 'http', ':authority' => 'h', ':path' => '/' . $i]);
+		}
+		$this->pump($server, $client);
+		self::assertSame(100, $requests, 'The server holds 100 streams; the client keeps the other 50 back.');
+		self::assertNotNull($server->getStream($streams[99]->getStreamId()));
+		self::assertNull($server->getStream($streams[100]->getStreamId()));
+
+		for ($i = 0; $i < 10; $i++) {
+			$streams[$i]->markLocalClosed();                   // ten streams complete and leave the server
+		}
+		$this->pump($server, $client);
+		self::assertSame(110, $requests, 'Each finished stream admits a waiting request.');
+		self::assertNull($server->getStream($streams[0]->getStreamId()));
+		$server->close();
+		$client->close();
+	}
+
+	public function testAStreamOverTheLimitIsRefusedBeforeTheClientAcknowledgesIt()
+	{
+		$server = new TH2Session(true);
+		$server->submitSettings([TNgHttp2::SETTINGS_MAX_CONCURRENT_STREAMS => 2]);
+		$requests = [];
+		$server->attachEventHandler('onRequest', function ($s, $stream) use (&$requests) {
+			$requests[] = $stream->getStreamId();
+		});
+		$invalid = [];
+		$server->attachEventHandler('onInvalidFrame', function ($s, $info) use (&$invalid) {
+			$invalid[] = $info['streamId'];
+		});
+		// A client that has not read the SETTINGS yet opens three streams.
+		$server->receive($this->rawClientPreface() . $this->rawRequests([1, 3, 5]));
+		self::assertSame([1, 3], $requests, 'The third stream never reaches the application.');
+		self::assertSame([5], $invalid);
+		$resets = array_values(array_filter($this->frames($server->send()), fn ($frame) => $frame['type'] === TNgHttp2::FRAME_RST_STREAM));
+		self::assertCount(1, $resets);
+		self::assertSame(5, $resets[0]['streamId']);
+		self::assertSame(pack('N', TNgHttp2::REFUSED_STREAM), $resets[0]['payload'], 'The client may retry a refused stream.');
+		self::assertTrue($server->wantsIo(), 'The connection stays open.');
+		$server->close();
+	}
+
+	public function testAStreamOverTheLimitEndsTheConnectionOnceTheClientAcknowledgedIt()
+	{
+		$server = new TH2Session(true);
+		$server->submitSettings([TNgHttp2::SETTINGS_MAX_CONCURRENT_STREAMS => 2]);
+		$requests = [];
+		$server->attachEventHandler('onRequest', function ($s, $stream) use (&$requests) {
+			$requests[] = $stream->getStreamId();
+		});
+		$invalid = [];
+		$server->attachEventHandler('onInvalidFrame', function ($s, $info) use (&$invalid) {
+			$invalid[] = $info['streamId'];
+		});
+		$server->receive($this->rawClientPreface());
+		$server->send();
+		$server->receive($this->rawFrame(TNgHttp2::FRAME_SETTINGS, 0x01, 0, ''));   // the client's SETTINGS ACK: it knows the limit
+		$server->receive($this->rawRequests([1, 3, 5]));
+		self::assertSame([1, 3], $requests);
+		self::assertSame([5], $invalid);
+		$frames = $this->frames($server->send());
+		self::assertCount(1, $frames);
+		self::assertSame(TNgHttp2::FRAME_GOAWAY, $frames[0]['type'], 'A client that ignores the acknowledged limit loses the connection.');
+		self::assertSame(pack('NN', 3, TNgHttp2::PROTOCOL_ERROR), substr($frames[0]['payload'], 0, 8), 'Last stream 3, PROTOCOL_ERROR.');
+		self::assertFalse($server->wantsIo());
+		$server->close();
+	}
+
+	/**
+	 * @return string The client connection preface and an empty SETTINGS frame.
+	 */
+	private function rawClientPreface(): string
+	{
+		return "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" . $this->rawFrame(TNgHttp2::FRAME_SETTINGS, 0, 0, '');
+	}
+
+	/**
+	 * @param int[] $streamIds The stream ids to open.
+	 * @return string One HEADERS frame per id (END_HEADERS, the request body open): indexed
+	 *   `:method GET`, `:scheme http`, `:path /`, and a literal `:authority`.
+	 */
+	private function rawRequests(array $streamIds): string
+	{
+		$bytes = '';
+		foreach ($streamIds as $id) {
+			$bytes .= $this->rawFrame(TNgHttp2::FRAME_HEADERS, 0x04, $id, "\x82\x86\x84\x41\x01h");
+		}
+		return $bytes;
+	}
+
+	public function testResetAfterEndSendsTheWholeResponseThenStopsThePeer()
+	{
+		[$server, $client] = $this->newPair();
+		$serverStream = null;
+		$server->attachEventHandler('onRequest', function ($s, $stream) use ($server, &$serverStream) {
+			$serverStream = $stream;
+			$server->respond($stream, [':status' => '413']);
+			$stream->write('too large');
+			$stream->setResetAfterEnd(true);
+			$stream->markLocalClosed();
+		});
+		$serverClosed = 0;
+		$server->attachEventHandler('onClose', function () use (&$serverClosed) {
+			$serverClosed++;
+		});
+		$status = null;
+		$body = '';
+		$clientClosed = 0;
+		$client->attachEventHandler('onResponse', function ($s, $stream) use (&$status) {
+			$status = $stream->getHeader(':status');
+		});
+		$client->attachEventHandler('onData', function ($s, $stream) use (&$body) {
+			$body .= $stream->getContents();
+		});
+		$client->attachEventHandler('onClose', function () use (&$clientClosed) {
+			$clientClosed++;
+		});
+		$request = $client->request([':method' => 'POST', ':scheme' => 'http', ':authority' => 'h', ':path' => '/upload']);
+		$id = $request->getStreamId();
+		$request->write('part one');                           // the upload goes on: no END_STREAM from the client
+		$server->receive($client->send());
+		self::assertFalse($serverStream->isRemoteClosed());
+		self::assertTrue($serverStream->isLocalClosed());
+		self::assertFalse($serverStream->hasEndStreamSent(), 'Nothing left the session yet.');
+
+		$wire = $server->send();
+		$frames = array_values(array_filter($this->frames($wire), fn ($frame) => $frame['streamId'] === $id));
+		self::assertSame(TNgHttp2::FRAME_HEADERS, $frames[0]['type']);
+		$last = array_pop($frames);
+		self::assertSame(TNgHttp2::FRAME_RST_STREAM, $last['type'], 'The reset follows the response.');
+		self::assertSame(pack('N', TNgHttp2::NO_ERROR), $last['payload'], 'RFC 9113 §8.1: NO_ERROR asks the client to stop.');
+		$data = array_values(array_filter($frames, fn ($frame) => $frame['type'] === TNgHttp2::FRAME_DATA));
+		self::assertSame('too large', implode('', array_column($data, 'payload')), 'The queued body was sent in full.');
+		self::assertSame(TNgHttp2::FLAG_END_STREAM, end($data)['flags'] & TNgHttp2::FLAG_END_STREAM, 'The response ended before the reset.');
+		self::assertTrue($serverStream->hasEndStreamSent());
+		self::assertSame(1, $serverClosed, 'nghttp2 closed the stream once the reset was sent.');
+		self::assertNull($server->getStream($id), 'The session does not wait for the client to end it.');
+		self::assertTrue($serverStream->isRemoteClosed(), 'A closed stream receives nothing more.');
+
+		$client->receive($wire);
+		self::assertSame('413', $status);
+		self::assertSame('too large', $body);
+		self::assertSame(1, $clientClosed);
+		self::assertFalse($request->isWritable(), 'The client stops sending.');
+
+		// DATA the client had in flight when the reset reached it: the session takes it and carries on.
+		$server->receive($this->rawFrame(TNgHttp2::FRAME_DATA, 0, $id, 'in flight'));
+		$next = $client->request([':method' => 'GET', ':scheme' => 'http', ':authority' => 'h', ':path' => '/next']);
+		$next->markLocalClosed();
+		$this->pump($server, $client);
+		self::assertSame(2, $serverClosed, 'A later request on the connection completes.');
+		$server->close();
+		$client->close();
+	}
+
+	public function testResetAfterEndSendsNoResetWhenThePeerHasFinished()
+	{
+		[$server, $client] = $this->newPair();
+		$serverStream = null;
+		$server->attachEventHandler('onRequest', function ($s, $stream) use ($server, &$serverStream) {
+			$serverStream = $stream;
+			$server->respond($stream, [':status' => '200']);
+			$stream->write('ok');
+			$stream->setResetAfterEnd(true);
+			$stream->markLocalClosed();
+		});
+		$request = $client->request([':method' => 'GET', ':scheme' => 'http', ':authority' => 'h', ':path' => '/']);
+		$request->markLocalClosed();                           // a complete request
+		$server->receive($client->send());
+		self::assertTrue($serverStream->isRemoteClosed());
+		$wire = $server->send();
+		self::assertNotContains(TNgHttp2::FRAME_RST_STREAM, $this->frameTypes($wire), 'Both sides ended: the stream closes without a reset.');
+		self::assertTrue($serverStream->hasEndStreamSent());
+		self::assertTrue($serverStream->getResetAfterEnd());
+		self::assertNull($server->getStream($request->getStreamId()));
+		$server->close();
+		$client->close();
+	}
+
+	public function testResetAfterEndWaitsForABodyLargerThanTheWindow()
+	{
+		[$server, $client] = $this->newPair();
+		$payload = str_repeat('0123456789', 20000);            // 200,000 bytes: three windows
+		$server->attachEventHandler('onRequest', function ($s, $stream) use ($server, $payload) {
+			$server->respond($stream, [':status' => '200']);
+			$stream->write($payload);
+			$stream->setResetAfterEnd(true);
+			$stream->markLocalClosed();
+		});
+		$body = '';
+		$closed = 0;
+		$client->attachEventHandler('onData', function ($s, $stream) use (&$body) {
+			$body .= $stream->getContents();
+		});
+		$client->attachEventHandler('onClose', function () use (&$closed) {
+			$closed++;
+		});
+		$request = $client->request([':method' => 'POST', ':scheme' => 'http', ':authority' => 'h', ':path' => '/upload']);
+		$request->write('part one');
+		$server->receive($client->send());
+		$first = $server->send();
+		self::assertNotContains(TNgHttp2::FRAME_RST_STREAM, $this->frameTypes($first), 'The window holds the body back, and the reset with it.');
+		$client->receive($first);
+		self::assertSame(0, $closed);
+		$this->pump($server, $client, 16);
+		self::assertSame($payload, $body, 'The client received every byte before the reset.');
+		self::assertSame(1, $closed);
+		$server->close();
+		$client->close();
+	}
+
+	public function testResetAfterEndFollowsTheTrailers()
+	{
+		[$server, $client] = $this->newPair();
+		$server->attachEventHandler('onRequest', function ($s, $stream) use ($server) {
+			$server->respond($stream, [':status' => '200']);
+			$stream->write('body');
+			$stream->setResetAfterEnd(true);
+			$stream->sendTrailers(['grpc-status' => '0']);
+		});
+		$trailer = null;
+		$client->attachEventHandler('onTrailers', function ($s, $stream) use (&$trailer) {
+			$trailer = $stream->getHeader('grpc-status');
+		});
+		$request = $client->request([':method' => 'POST', ':scheme' => 'http', ':authority' => 'h', ':path' => '/rpc']);
+		$id = $request->getStreamId();
+		$request->write('part one');
+		$server->receive($client->send());
+		$wire = $server->send();
+		$frames = array_values(array_filter($this->frames($wire), fn ($frame) => $frame['streamId'] === $id));
+		self::assertSame(
+			[TNgHttp2::FRAME_HEADERS, TNgHttp2::FRAME_DATA, TNgHttp2::FRAME_HEADERS, TNgHttp2::FRAME_RST_STREAM],
+			array_column($frames, 'type'),
+			'The trailers carry END_STREAM and the reset follows them.'
+		);
+		self::assertSame(pack('N', TNgHttp2::NO_ERROR), $frames[3]['payload']);
+		$client->receive($wire);
+		self::assertSame('0', $trailer);
+		self::assertFalse($request->isWritable());
+		$server->close();
+		$client->close();
+	}
+
+	public function testResetAfterEndSetOnceTheEndWasSentResetsAtOnce()
+	{
+		[$server, $client] = $this->newPair();
+		$serverStream = null;
+		$server->attachEventHandler('onRequest', function ($s, $stream) use ($server, &$serverStream) {
+			$serverStream = $stream;
+			$server->respond($stream, [':status' => '200']);
+			$stream->markLocalClosed();
+		});
+		$closed = 0;
+		$client->attachEventHandler('onClose', function () use (&$closed) {
+			$closed++;
+		});
+		$request = $client->request([':method' => 'POST', ':scheme' => 'http', ':authority' => 'h', ':path' => '/upload']);
+		$id = $request->getStreamId();
+		$this->pump($server, $client, 2);
+		self::assertTrue($serverStream->hasEndStreamSent());
+		self::assertFalse($serverStream->isRemoteClosed());
+		self::assertSame($serverStream, $server->getStream($id), 'An ended response leaves the stream open while the client sends.');
+		self::assertSame(0, $closed);
+
+		$serverStream->setResetAfterEnd(true);
+		$wire = $server->send();
+		$frames = $this->frames($wire);
+		self::assertCount(1, $frames);
+		self::assertSame(TNgHttp2::FRAME_RST_STREAM, $frames[0]['type']);
+		self::assertSame($id, $frames[0]['streamId']);
+		self::assertSame(pack('N', TNgHttp2::NO_ERROR), $frames[0]['payload']);
+		self::assertNull($server->getStream($id));
+		$client->receive($wire);
+		self::assertSame(1, $closed);
+		$serverStream->setResetAfterEnd(true);                 // the stream closed: nothing more is submitted
+		self::assertSame('', $server->send());
+		$server->close();
+		$client->close();
+	}
+
+	public function testResetAfterEndReturnsUnreadBytesToTheConnectionWindow()
+	{
+		$options = new TH2Options();
+		$options->setConsumeOnRead(true);
+		$server = new TH2Session(true, $options);
+		$client = new TH2Session(false);
+		$server->submitSettings([]);
+		$client->submitSettings([]);
+		$serverStream = null;
+		$server->attachEventHandler('onRequest', function ($s, $stream) use (&$serverStream) {
+			$serverStream = $stream;
+		});
+		$request = $client->request([':method' => 'POST', ':scheme' => 'http', ':authority' => 'h', ':path' => '/upload']);
+		$request->write(str_repeat('x', 60000));
+		$this->pump($server, $client, 4);
+		self::assertSame(60000, $serverStream->getIncomingLength(), 'The upload sits unread.');
+		self::assertSame(65535 - 60000, $client->getRemoteWindowSize());
+
+		$server->respond($serverStream, [':status' => '200']);
+		$serverStream->setResetAfterEnd(true);
+		$serverStream->markLocalClosed();
+		$this->pump($server, $client, 4);
+		self::assertNull($server->getStream($request->getStreamId()));
+		self::assertSame(65535, $client->getRemoteWindowSize(), 'The unread bytes of the reset stream reopened the connection window.');
+		$server->close();
+		$client->close();
+	}
+
+	public function testEndStreamSentIsTrackedOnAClientStream()
+	{
+		[$server, $client] = $this->newPair();
+		$request = $client->request([':method' => 'POST', ':scheme' => 'http', ':authority' => 'h', ':path' => '/']);
+		$request->write('body');
+		$client->send();
+		self::assertFalse($request->hasEndStreamSent(), 'DATA without END_STREAM does not end the side.');
+		$request->markLocalClosed();
+		self::assertFalse($request->hasEndStreamSent(), 'Local-closed, and the frame is not out yet.');
+		$client->send();
+		self::assertTrue($request->hasEndStreamSent());
+		$server->close();
+		$client->close();
+	}
+
+	/**
+	 * @param string $bytes A byte sequence of whole HTTP/2 frames.
+	 * @return array<int, array{type: int, flags: int, streamId: int, payload: string}> The frames.
+	 */
+	private function frames(string $bytes): array
+	{
+		$frames = [];
+		for ($offset = 0; $offset + 9 <= strlen($bytes);) {
+			$length = unpack('N', "\0" . substr($bytes, $offset, 3))[1];
+			$frames[] = [
+				'type' => ord($bytes[$offset + 3]),
+				'flags' => ord($bytes[$offset + 4]),
+				'streamId' => unpack('N', substr($bytes, $offset + 5, 4))[1] & 0x7FFFFFFF,
+				'payload' => substr($bytes, $offset + 9, $length),
+			];
+			$offset += 9 + $length;
+		}
+		return $frames;
 	}
 
 	/**

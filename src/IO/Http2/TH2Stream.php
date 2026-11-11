@@ -658,7 +658,10 @@ class TH2Stream extends TComponent implements StreamInterface
 	 * first, which {@see close()} does not do.  nghttp2 then closes the stream, so
 	 * {@see TH2Session::onClose} is raised and the session forgets it without waiting for the peer.
 	 * Set after the END_STREAM frame was sent, the reset is submitted at once.  On a client stream the
-	 * reset discards the response.
+	 * reset discards the response.  From the moment this side has finished writing
+	 * ({@see isLocalClosed()}) the session discards DATA that still arrives on the stream and raises
+	 * no {@see TH2Session::onData} for it: the END_STREAM frame can wait on the peer's flow-control
+	 * window, and the peer was going to be stopped.
 	 * @param bool $value Whether to reset the stream after this side's END_STREAM frame.
 	 * @since 1.5.0
 	 */

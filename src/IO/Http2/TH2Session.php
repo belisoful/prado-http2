@@ -929,18 +929,26 @@ class TH2Session extends TComponent
 	/**
 	 * Opens a client request stream with the given headers (including pseudo-headers).  Names are
 	 * lowercased and pseudo-headers go first; the stream keeps the headers in that form.
+	 *
+	 * With $endStream the request has no body: the HEADERS frame carries END_STREAM and the stream
+	 * is local-closed at once, so a {@see TH2Stream::write()} throws.  A request ended later with
+	 * {@see TH2Stream::markLocalClosed()} ends on a DATA frame, which nghttp2 holds back while the
+	 * peer's flow-control window for the stream is zero, even when the frame is empty.
 	 * @param array<string, string> $headers The request headers (e.g. ':method' => 'CONNECT').
+	 * @param bool $endStream Whether the request ends with its headers. Default false. Since 1.5.0.
 	 * @throws THttp2Exception When a name repeats or is not valid, a value is not valid, or the
 	 *   request cannot be submitted.
 	 * @return TH2Stream The new stream.
 	 */
-	public function request(array $headers): TH2Stream
+	public function request(array $headers, bool $endStream = false): TH2Stream
 	{
 		$this->assertOpen();
 		$headers = $this->normalizeHeaders($headers);
 		$keep = [];
 		$nva = $this->buildHeaders($headers, $keep);
-		$streamId = $this->getFfiDirect()->nghttp2_submit_request2($this->getSessionDirect(), null, $nva, count($headers), \FFI::addr($this->getDataProviderDirect()), null);
+		// Without a data provider nghttp2 sets END_STREAM on the HEADERS frame.
+		$provider = $endStream ? null : \FFI::addr($this->getDataProviderDirect());
+		$streamId = $this->getFfiDirect()->nghttp2_submit_request2($this->getSessionDirect(), null, $nva, count($headers), $provider, null);
 		if ($streamId < 0) {
 			throw new THttp2Exception('http2_session_failed', TNgHttp2::strerror($streamId));
 		}
@@ -948,28 +956,49 @@ class TH2Session extends TComponent
 		$stream->markHeadersSubmitted();
 		$streams = &$this->getStreamsDirect();
 		$streams[$streamId] = $stream;
+		if ($endStream) {
+			$stream->markLocalClosed();
+		}
 		$this->outputChanged();
 		return $stream;
 	}
 
 	/**
 	 * Sends response headers on a server stream, accepting it (e.g. ':status' => '200').
+	 *
+	 * With $endStream this side ends with the response: the stream is local-closed, so a later
+	 * {@see TH2Stream::write()} throws.  When nothing is queued on the stream and no trailers wait,
+	 * the HEADERS frame itself carries END_STREAM.  That response needs no flow-control window: a
+	 * response ended with {@see TH2Stream::markLocalClosed()} after this call ends on a DATA frame,
+	 * which nghttp2 holds back while the peer's window for the stream is zero, even when the frame
+	 * is empty.  Bytes already queued and trailers are sent first, as markLocalClosed() sends them.
+	 * A stream whose local side is closed already is treated as $endStream.  An informational (1xx)
+	 * response never ends the stream.
 	 * @param TH2Stream $stream The request stream to respond on.
 	 * @param array<string, string> $headers The response headers.
+	 * @param bool $endStream Whether this side ends with the response. Default false. Since 1.5.0.
 	 * @throws THttp2Exception When a name repeats or is not valid, a value is not valid, or the
 	 *   response cannot be submitted.
 	 */
-	public function respond(TH2Stream $stream, array $headers): void
+	public function respond(TH2Stream $stream, array $headers, bool $endStream = false): void
 	{
 		$this->assertOpen();
 		$headers = $this->normalizeHeaders($headers);
 		$keep = [];
 		$nva = $this->buildHeaders($headers, $keep);
-		$result = $this->getFfiDirect()->nghttp2_submit_response2($this->getSessionDirect(), $stream->getStreamId(), $nva, count($headers), \FFI::addr($this->getDataProviderDirect()));
+		$informational = str_starts_with($headers[':status'] ?? '', '1');
+		$endStream = ($endStream || $stream->isLocalClosed()) && !$informational;
+		// Without a data provider nghttp2 sets END_STREAM on the HEADERS frame.
+		$bare = $endStream && !$stream->hasOutgoing() && !$stream->hasTrailersPending();
+		$provider = $bare ? null : \FFI::addr($this->getDataProviderDirect());
+		$result = $this->getFfiDirect()->nghttp2_submit_response2($this->getSessionDirect(), $stream->getStreamId(), $nva, count($headers), $provider);
 		if ($result !== 0) {
 			throw new THttp2Exception('http2_session_failed', TNgHttp2::strerror($result));
 		}
 		$stream->markHeadersSubmitted();
+		if ($endStream && !$stream->isLocalClosed()) {
+			$stream->markLocalClosed();
+		}
 		$this->outputChanged();
 	}
 
@@ -1726,7 +1755,10 @@ class TH2Session extends TComponent
 	}
 
 	/**
-	 * Handles a DATA chunk: buffers it on the stream and raises {@see onData}.
+	 * Handles a DATA chunk: buffers it on the stream and raises {@see onData}.  A stream set to
+	 * {@see TH2Stream::setResetAfterEnd() reset after its end} whose local side is closed discards
+	 * the chunk and raises nothing: its END_STREAM frame may wait on the peer's window, and the
+	 * buffer would grow until then.
 	 * @param int $streamId The stream identifier.
 	 * @param string $bytes The received bytes.
 	 * @return int Always 0 (continue).
@@ -1734,11 +1766,36 @@ class TH2Session extends TComponent
 	private function handleDataChunk(int $streamId, string $bytes): int
 	{
 		$stream = $this->getStreamsDirect()[$streamId] ?? null;
-		if ($stream !== null) {
-			$stream->pushIncoming($bytes);
-			$this->onData($stream);
+		if ($stream === null) {
+			return 0;
 		}
+		if ($stream->getResetAfterEnd() && $stream->isLocalClosed()) {
+			// The application finished and asked the peer to stop: nothing will read these bytes.
+			$this->discardReceived(strlen($bytes));
+			return 0;
+		}
+		$stream->pushIncoming($bytes);
+		$this->onData($stream);
 		return 0;
+	}
+
+	/**
+	 * Accounts for DATA bytes the session discards.  When nghttp2's automatic window updates are off
+	 * ({@see TH2Options::setNoAutoWindowUpdate()} or {@see TH2Options::setConsumeOnRead()}) the bytes
+	 * go back to the connection window, so a discarded stream cannot stall the others; the stream's
+	 * own window stays as it is and holds the peer.  Under automatic flow control nghttp2 has
+	 * counted them already.
+	 * @param int $size The number of discarded bytes.
+	 * @since 1.5.0
+	 */
+	private function discardReceived(int $size): void
+	{
+		$options = $this->getOptionsDirect();
+		if ($size <= 0 || $options === null || !($options->getNoAutoWindowUpdate() || $options->getConsumeOnRead())) {
+			return;
+		}
+		$this->getFfiDirect()->nghttp2_session_consume_connection($this->getSessionDirect(), $size);
+		$this->outputChanged();
 	}
 
 	/**

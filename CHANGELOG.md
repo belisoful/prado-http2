@@ -7,6 +7,8 @@ All notable changes to `belisoful/prado-http2` are recorded here. The format fol
 
 ### Added
 - `TH2Stream::setResetAfterEnd(true)` / `getResetAfterEnd()`: end a stream after a complete response while the peer still sends. The queued bytes, the trailers, and END_STREAM are sent first; the session then submits RST_STREAM with NO_ERROR (RFC 9113 §8.1), nghttp2 closes the stream, and `onClose` is raised. `markLocalClosed()` alone leaves such a stream in the session until the peer ends it, and `close()` discards the queued bytes. No reset is sent when the peer has finished by the time END_STREAM goes out. Set after END_STREAM was sent, the reset is submitted at once.
+- `TH2Session::respond($stream, $headers, $endStream)` and `request($headers, $endStream)`: a third (second) argument, false by default. When true this side ends with the headers: the stream is local-closed at once, and with nothing queued and no trailers waiting the HEADERS frame carries END_STREAM. A message ended with `markLocalClosed()` ends on a DATA frame, and nghttp2 holds even an empty DATA frame back while the peer's flow-control window for the stream is zero: a client that advertised `SETTINGS_INITIAL_WINDOW_SIZE` 0 received a `403` and never its end, and a `GET` to such a server never completed. `respond()` on a stream whose local side is closed already ends the same way. An informational (1xx) response never ends the stream.
+- A stream set to `ResetAfterEnd` discards the DATA that arrives once this side has finished writing, and raises no `onData` for it. Its END_STREAM frame can wait on the peer's window, and under automatic flow control the buffer grew without limit until then. With `NoAutoWindowUpdate` or `ConsumeOnRead` the session returns the discarded bytes to the connection window; the stream's own window stays closed and holds the peer.
 - `TH2Stream::hasEndStreamSent()` and `markEndStreamSent()`: whether the frame that ends this side (DATA or trailing HEADERS with END_STREAM) has left `send()`.
 - `TH2Stream::isRemoteClosed()`: whether the peer has finished sending. `eof()` also needs the buffer read.
 - `TH2Session::DEFAULT_MAX_CONCURRENT_STREAMS` (100).
@@ -15,6 +17,7 @@ All notable changes to `belisoful/prado-http2` are recorded here. The format fol
 - A server's `submitSettings()` advertises `SETTINGS_MAX_CONCURRENT_STREAMS => 100` unless the caller gives that id. nghttp2's default is no limit: a client could open any number of streams, and each one a server had answered and ended stayed in the session until the client ended it (20,000 such streams were observed in one session). nghttp2 enforces the advertised limit: a stream over it raises `onInvalidFrame` and no `onRequest`, is refused (RST_STREAM REFUSED_STREAM) until the client has acknowledged the SETTINGS, and ends the connection (GOAWAY PROTOCOL_ERROR) after that.
 
 ### Upgrading
+- A subclass that overrides `TH2Session::respond()` or `request()` adds the `bool $endStream = false` parameter.
 - A server that relied on more than 100 concurrent streams per connection passes its own `TNgHttp2::SETTINGS_MAX_CONCURRENT_STREAMS` to `submitSettings()`. A client that follows the limit queues the requests over it, so they wait where they used to run at once.
 
 ## [1.4.0] - 2026-11-10

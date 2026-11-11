@@ -114,8 +114,7 @@ $stream = $session->request([
     ':scheme'    => 'https',
     ':authority' => 'example.com',
     ':path'      => '/',
-]);
-$stream->markLocalClosed();                      // a GET has no body — end the request
+], true);                                        // a GET has no body: the HEADERS frame ends the request
 
 $transport->write($session->send());             // preface + SETTINGS + request
 $session->receive($transport->read(65536));
@@ -135,6 +134,17 @@ $stream->write('Payload too large');
 $stream->setResetAfterEnd(true);                 // after END_STREAM: RST_STREAM NO_ERROR while the client still sends
 $stream->markLocalClosed();
 ```
+
+From the moment such a stream has finished writing, the session discards DATA that still arrives on it and raises no `onData`: the END_STREAM frame can wait on the client's flow-control window, and the buffer would grow until then.
+
+A message with no body ends on its HEADERS frame when the third argument of `respond()` (the second of `request()`) is true. This matters under flow control: `markLocalClosed()` after `respond()` ends the stream on a DATA frame, and nghttp2 holds even an empty DATA frame back while the peer's window for the stream is zero. A HEADERS frame needs no window.
+
+```php
+$stream->setResetAfterEnd(true);
+$session->respond($stream, [':status' => '403'], true);   // HEADERS with END_STREAM, then the reset
+```
+
+With `$endStream` the stream is local-closed at once and a later `write()` throws. Bytes written before `respond()` and trailers are still sent first. An informational (1xx) response never ends the stream.
 
 `isLocalClosed()` and `isRemoteClosed()` report each direction: this side has finished writing, and the peer has finished sending. `eof()` is true once the peer has finished and the buffer is read. `hasEndStreamSent()` is true once this side's END_STREAM frame has left `send()`.
 

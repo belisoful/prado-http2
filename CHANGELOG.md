@@ -17,7 +17,8 @@ All notable changes to `belisoful/prado-http2` are recorded here. The format fol
 - A server's `submitSettings()` advertises `SETTINGS_MAX_CONCURRENT_STREAMS => 100` unless the caller gives that id. nghttp2's default is no limit: a client could open any number of streams, and each one a server had answered and ended stayed in the session until the client ended it (20,000 such streams were observed in one session). nghttp2 enforces the advertised limit: a stream over it raises `onInvalidFrame` and no `onRequest`, is refused (RST_STREAM REFUSED_STREAM) until the client has acknowledged the SETTINGS, and ends the connection (GOAWAY PROTOCOL_ERROR) after that.
 
 ### Upgrading
-- A subclass that overrides `TH2Session::respond()` or `request()` adds the `bool $endStream = false` parameter.
+- A class that extends `TH2Session` and overrides `respond()` or `request()` adds the new parameter and passes it to the parent. The signatures are `respond(TH2Stream $stream, array $headers, bool $endStream = false): void` and `request(array $headers, bool $endStream = false): TH2Stream`. An override with the 1.4.0 signature is a PHP fatal error when the class loads (`Declaration of ...::respond(...) must be compatible with Prado\IO\Http2\TH2Session::respond(...)`). Code that calls the two methods needs no change, and neither does a PHPUnit mock of `TH2Session`.
+- `respond()` on a stream whose local side is closed already (`markLocalClosed()` before it) now puts END_STREAM on the HEADERS frame when nothing is queued and no trailers wait. An empty DATA frame carried it before. A response ended with `markLocalClosed()` after `respond()` is sent as before.
 - A server that relied on more than 100 concurrent streams per connection passes its own `TNgHttp2::SETTINGS_MAX_CONCURRENT_STREAMS` to `submitSettings()`. A client that follows the limit queues the requests over it, so they wait where they used to run at once.
 
 ## [1.4.0] - 2026-11-10

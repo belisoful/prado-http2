@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" bootstrap="./tests/test_tools/phpunit_bootstrap.php" colors="true" stopOnFailure="false" xsi:noNamespaceSchemaLocation="https://schema.phpunit.de/10.5/phpunit.xsd" cacheDirectory=".phpunit.cache">
+<phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" bootstrap="./tests/test_tools/phpunit_bootstrap.php" colors="true" stopOnFailure="false" failOnWarning="true" failOnRisky="true" xsi:noNamespaceSchemaLocation="https://schema.phpunit.de/10.5/phpunit.xsd" cacheDirectory=".phpunit.cache">
   <testsuites>
 	<testsuite name="unit">
 	  <directory suffix="Test.php">./tests/unit</directory>
@@ -11,6 +11,12 @@
   <logging>
 	<testdoxHtml outputFile="./build/tests/index.html"/>
   </logging>
+  <!-- Coverage source. Inert until a run asks for coverage, as `composer coverage` does. -->
+  <source>
+	<include>
+	  <directory suffix=".php">./src</directory>
+	</include>
+  </source>
   <extensions>
   </extensions>
 </phpunit>

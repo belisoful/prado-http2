@@ -10,6 +10,7 @@ $finder = PhpCsFixer\Finder::create()
 	->exclude('docs/')
 	->exclude('vendor/')
 	->exclude('agents/')
+	->exclude('build/')
 	->in(__DIR__);
 
 $config = new PhpCsFixer\Config();

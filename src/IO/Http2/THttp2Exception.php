@@ -20,7 +20,7 @@ use Prado\Exceptions\TIOException;
  * it.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 1.0.0
+ * @since 0.9.0
  */
 class THttp2Exception extends TIOException
 {

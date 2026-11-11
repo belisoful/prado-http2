@@ -3,6 +3,41 @@
 All notable changes to `belisoful/prado-http2` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Security
+- A received header block had no size limit. nghttp2 does not bound the decoded size of a header block and treats `SETTINGS_MAX_HEADER_LIST_SIZE` as advisory, and HPACK lets one 4000-byte table entry be referenced by 1-byte indexes: 147 KB on the wire decoded to a single 574 MB header value. Under a 128 MB `memory_limit` that was a fatal error inside the FFI callback, so one unauthenticated request ended a server process and every connection it held. The session now counts each block's header list size (name length + value length + 32 per field, RFC 9113 §6.5.2). A block over the limit is dropped, its stream is reset (RST_STREAM INTERNAL_ERROR), and `onInvalidFrame` is raised with `error` `TNgHttp2::ERR_TEMPORAL_CALLBACK_FAILURE`; the session stays usable. The limit is 64 KiB by default and applies to request headers, response headers, and trailers.
+
+### Added
+- `TH2Options::setMaxHeaderListSize($bytes)` / `getMaxHeaderListSize()`, `TH2Session::getMaxHeaderListSize()`, and `TH2Session::DEFAULT_MAX_HEADER_LIST_SIZE` (65536): the header list limit. Null is the default, `0` turns the limit off. `submitSettings()` advertises it as `SETTINGS_MAX_HEADER_LIST_SIZE` unless the caller gives that id.
+- `TH2Options::setConsumeOnRead(true)`: receive backpressure. nghttp2's automatic window updates are off, and each `TH2Stream::read()`, `getContents()`, and `readAsync()` reports the bytes it returns, so the peer's window reopens as the application reads and a stream buffers at most the window. Bytes left unread when a stream closes, or when the application closes it, go back to the connection window. Under the default automatic flow control a stream still buffers whatever the peer sends until it is read; the README now says so ("Limits and flow control").
+- `TH2Session::consumeReceived($streamId, $size)`: the session side of the above, called by `TH2Stream`. `nghttp2_session_consume_connection` in the FFI declaration.
+- `TH2Stream::getIncomingLength()`: the received bytes buffered and not yet read.
+- `TH2Stream::hasHeadersSubmitted()` and `markHeadersSubmitted()`: whether this side's HEADERS were submitted (a client request, or a server `respond()`).
+- Error code `http2_header_invalid`: `request()`, `respond()`, and `submitTrailers()` reject a header name that is not a token (one leading colon marks a pseudo-header) and a value with a CR, LF, or NUL character (RFC 9113 §8.2.1). nghttp2 sent them as given, and a peer running nghttp2 dropped the field without notice.
+- Composer scripts `coverage`, `coverage-path`, and `coverage-html`; phpunit.xml names `src/` as the coverage source.
+
+### Fixed
+- `TH2Stream::close()` on a request the server never answered sent nothing once the peer had finished (every `curl` GET): with no response submitted the stream has no data provider, so the resume was a no-op, the client waited forever, and the stream stayed in the session. Such a stream is now reset (RST_STREAM CANCEL).
+- `TH2Session::close()` raised no `onClose` for the streams still open, so a handler never learned of a connection that dropped (the pump closes the session when the transport ends). `onClose` is now raised for each of them, after the session is closed; the first Throwable a handler raises is rethrown once every stream was reported. A session collected without `close()` raises none.
+- A `TCancellationToken` cancelled between a wake that did not satisfy the wait and the fiber's resume (`awaitResponse()` after a 1xx response; `writeAsync()`/`waitWritable()` after a partial drain) surfaced as `Error: Must call suspend() before calling throw()`. The wait now throws the token's `TCancelledException`.
+- An `onClose` handler that threw left the closed stream in the session until the session closed.
+- `sendTrailers()` did not wake a fiber waiting in `writeAsync()`, as `markLocalClosed()` does.
+- `send()` lost the bytes it had already drained when nghttp2 failed to produce output; they are kept for the next `send()`.
+
+### Changed
+- `pradosoft/prado` (`^4.4@dev`) is a requirement of the package, as it is of `prado-websocket`. The classes extend `TComponent`, implement PSR-7's `StreamInterface`, and use `Prado\IO\Async`; composer previously installed the package beside any framework version.
+- CI installs the php-cs-fixer and PHPStan versions composer.json pins, fails a test step when any test is skipped, runs with `contents: read` permissions, and has a job on Ubuntu 24.04 (libnghttp2 1.59.0) that checks the library is reported as `http2_library_too_old` on PHP 8.2, 8.4, and 8.5.
+- `Http2TlsAlpnTest` fails when a TLS handshake fails (it skipped), and the functional suite serves `curl --http2` over TLS through `pump()`.
+- phpunit.xml sets `failOnWarning` and `failOnRisky`. php-cs-fixer skips `build/`.
+- `@since` tags name the release each member first shipped in: the five classes from 0.9.0 said 1.0.0, and members added in 1.0.0 to 1.3.0 without a tag read as the class version.
+
+### Upgrading
+- A header block over 64 KiB now resets its stream. A session that must accept larger header lists sets `TH2Options::setMaxHeaderListSize()`; advertising a larger `SETTINGS_MAX_HEADER_LIST_SIZE` through `submitSettings()` does not raise the enforced limit.
+- `onClose` handlers now also run from `TH2Session::close()`, with the session already closed: a handler that calls the session there gets `http2_session_closed`. Code that raised its own close events for the streams still open at shutdown can drop that.
+- `request()`, `respond()`, and `submitTrailers()` throw `http2_header_invalid` for a name or a value HTTP/2 forbids, where the field used to be sent.
+- `TH2Stream::close()` on an unanswered server stream sends RST_STREAM. To refuse a request with a status, `respond()` first.
+
 ## [1.3.0] - 2026-11-03
 
 ### Added
@@ -43,6 +78,7 @@ All notable changes to `belisoful/prado-http2` are recorded here. The format fol
 - A regular header placed before the pseudo-headers passed submit and the peer reset the stream (the client saw only `onClose`, the server never raised `onRequest`).
 - `mergeHeaders()` renumbered a digit-only header name (`array_merge`), so `getHeader('123')` returned null after a merge.
 - `sendTrailers()` after the body had already ended was silently dropped; it now throws `RuntimeException`, as `write()` does.
+- The package `homepage`, the `@link` tag in every class header, and the README install command named `pradosoft/prado-http2`; the package is `belisoful/prado-http2`.
 
 ### Changed
 - A client session declines server push: `submitSettings()` adds `SETTINGS_ENABLE_PUSH => 0` unless the caller sets that id (pushed streams have no `TH2Stream` and are discarded in any case).
@@ -51,9 +87,6 @@ All notable changes to `belisoful/prado-http2` are recorded here. The format fol
 - PHPStan runs at level 4 with `treatPhpDocTypesAsCertain: false`, matching the framework.
 - CI uses `actions/checkout@v7` and `actions/cache@v6`; the dependency cache keys on `composer.json` per PHP version (the lock file is not committed) and the job times out after 30 minutes.
 - Development dependencies pin `friendsofphp/php-cs-fixer` 3.95.27 and `phpstan/phpstan` 2.3.0, the versions PRADO pins.
-
-### Fixed
-- The package `homepage`, the `@link` tag in every class header, and the README install command named `pradosoft/prado-http2`; the package is `belisoful/prado-http2`.
 
 ### Upgrading
 - Run on PHP 8.2 or later. PHP 8.1 is no longer supported: PRADO 4.4 does not install on it.

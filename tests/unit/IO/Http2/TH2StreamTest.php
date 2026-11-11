@@ -320,9 +320,127 @@ class TH2StreamTest extends PHPUnit\Framework\TestCase
 		$session->expects(self::never())->method('resetStream');
 		$session->expects(self::once())->method('resumeStream')->with(5);
 		$stream = new TH2Stream($session, 5, []);
+		$stream->markHeadersSubmitted();                       // a response (or the request) went out
 		$stream->markRemoteClosed();
 		$stream->close();
 		self::assertFalse($stream->isWritable());
+	}
+
+	public function testCloseCancelsAStreamWhoseHeadersWereNeverSubmitted()
+	{
+		// A request the server never answered has no data provider: a resume would send nothing and
+		// the peer would wait for a response forever.
+		$session = $this->createMock(TH2Session::class);
+		$session->expects(self::once())->method('resetStream')->with(5, \Prado\IO\Http2\TNgHttp2::CANCEL);
+		$session->expects(self::never())->method('resumeStream');
+		$stream = new TH2Stream($session, 5, []);
+		self::assertFalse($stream->hasHeadersSubmitted());
+		$stream->markRemoteClosed();                           // the peer finished its request
+		$stream->close();
+		$stream->close();                                      // idempotent: no second reset
+	}
+
+	public function testHeadersSubmittedIsSetOnce()
+	{
+		$stream = $this->stream();
+		self::assertFalse($stream->hasHeadersSubmitted());
+		$stream->markHeadersSubmitted();
+		self::assertTrue($stream->hasHeadersSubmitted());
+	}
+
+	public function testIncomingLengthCountsTheUnreadBytes()
+	{
+		$stream = $this->stream();
+		self::assertSame(0, $stream->getIncomingLength());
+		$stream->pushIncoming('abcdefg');
+		self::assertSame(7, $stream->getIncomingLength());
+		$stream->read(3);
+		self::assertSame(4, $stream->getIncomingLength());
+		$stream->getContents();
+		self::assertSame(0, $stream->getIncomingLength());
+	}
+
+	public function testReadsReportTheirBytesToTheSession()
+	{
+		$reported = [];
+		$session = $this->createMock(TH2Session::class);
+		$session->method('consumeReceived')->willReturnCallback(function (int $streamId, int $size) use (&$reported) {
+			$reported[] = [$streamId, $size];
+		});
+		$stream = new TH2Stream($session, 7, []);
+		$stream->pushIncoming('abcdefghij');
+		self::assertSame([], $reported, 'Buffering reports nothing.');
+		$stream->read(3);
+		$stream->read(0);                                      // returns nothing: nothing to report
+		self::assertSame('defg', $stream->read(4));
+		self::assertSame([[7, 3], [7, 4]], $reported);
+		self::assertSame('hij', $stream->getContents());
+		self::assertSame([[7, 3], [7, 4], [7, 3]], $reported);
+		$stream->getContents();                                // empty: no report
+		self::assertCount(3, $reported);
+	}
+
+	public function testAClosedStreamReleasesItsUnreadBytesOnce()
+	{
+		$reported = [];
+		$session = $this->createMock(TH2Session::class);
+		$session->method('consumeReceived')->willReturnCallback(function (int $streamId, int $size) use (&$reported) {
+			$reported[] = [$streamId, $size];
+		});
+		$stream = new TH2Stream($session, 7, []);
+		$stream->pushIncoming('abcdefghij');
+		$stream->read(2);
+		$stream->markClosed();                                 // nghttp2 closed the stream with 8 bytes unread
+		self::assertSame([[7, 2], [0, 8]], $reported, 'The remainder goes back to the connection window (stream 0).');
+		self::assertSame('cdefghij', $stream->read(100), 'The bytes stay readable.');
+		$stream->markClosed();
+		$stream->close();
+		self::assertSame([[7, 2], [0, 8]], $reported, 'Released bytes are not reported again.');
+	}
+
+	public function testCloseReleasesTheBytesItDiscards()
+	{
+		$reported = [];
+		$session = $this->createMock(TH2Session::class);
+		$session->method('consumeReceived')->willReturnCallback(function (int $streamId, int $size) use (&$reported) {
+			$reported[] = [$streamId, $size];
+		});
+		$stream = new TH2Stream($session, 7, []);
+		$stream->pushIncoming('abcde');
+		$stream->close();
+		self::assertSame([[0, 5]], $reported, 'The discarded buffer goes back to the connection window (stream 0).');
+		$stream->pushIncoming('late');                         // dropped: the stream is detached
+		self::assertSame(0, $stream->getIncomingLength());
+		self::assertSame([[0, 5]], $reported, 'Nothing more is reported.');
+	}
+
+	public function testBuffersCompactOnlyPastTheThreshold()
+	{
+		// The consumed prefix is cut once it is at least 1 MiB and at least half the buffer: a read
+		// neither copies the remainder every time (quadratic) nor keeps the whole body (unbounded).
+		$mib = 1048576;
+		$session = $this->createMock(TH2Session::class);
+		$stream = new class ($session, 1) extends TH2Stream {
+			public function rawIncomingLength(): int
+			{
+				return strlen($this->getIncomingDirect());
+			}
+
+			public function rawIncomingOffset(): int
+			{
+				return $this->getIncomingOffsetDirect();
+			}
+		};
+		$stream->pushIncoming(str_repeat('a', $mib) . str_repeat('b', $mib) . str_repeat('c', $mib));
+		$stream->read($mib - 1);
+		self::assertSame([3 * $mib, $mib - 1], [$stream->rawIncomingLength(), $stream->rawIncomingOffset()], 'Under 1 MiB consumed: kept.');
+		$stream->read(1);
+		self::assertSame([3 * $mib, $mib], [$stream->rawIncomingLength(), $stream->rawIncomingOffset()], '1 MiB consumed is a third of the buffer: kept.');
+		self::assertSame(str_repeat('b', 8), $stream->read(8));
+		$stream->read($mib / 2 - 8);
+		self::assertSame([3 * $mib / 2, 0], [$stream->rawIncomingLength(), $stream->rawIncomingOffset()], 'Half consumed: the prefix is cut.');
+		self::assertSame(str_repeat('b', 4), $stream->read(4), 'The remainder is intact.');
+		self::assertSame(3 * $mib / 2 - 4, $stream->getIncomingLength());
 	}
 
 	public function testCloseAfterBothSidesEndedTouchesNothing()
@@ -878,6 +996,61 @@ class TH2StreamTest extends PHPUnit\Framework\TestCase
 		self::assertFalse($stream->hasFinalResponse(), 'A 1xx is informational.');
 		$stream->mergeHeaders([':status' => '204']);
 		self::assertTrue($stream->hasFinalResponse());
+	}
+
+	public function testSendTrailersWakesAWaitingWriter()
+	{
+		$this->requireAsync();
+		$stream = $this->stream();
+		$stream->setWriteHighWaterMark(4);
+		$writer = TAsync::run(fn () => $stream->writeAsync('abcdefg'));   // 7 > 4: waits
+		self::assertFalse($writer->isComplete());
+		$stream->sendTrailers(['x-checksum' => 'abc']);        // ends the local side, as markLocalClosed() does
+		try {
+			$writer->await();
+			self::fail('The writer was not woken.');
+		} catch (\RuntimeException $e) {
+			self::assertStringContainsString('local side is closed', $e->getMessage());
+		}
+		self::assertSame(7, $stream->getOutgoingLength(), 'The bytes stay queued ahead of the trailers.');
+	}
+
+	public function testAwaitResponseThrowsATokenCancelledBetweenAnInformationalWakeAndTheResume()
+	{
+		$this->requireAsync();
+		$stream = $this->stream([':method' => 'GET']);
+		$token = new TCancellationToken();
+		$future = TAsync::run(fn () => $stream->awaitResponse($token));
+		$stream->mergeHeaders([':status' => '103']);           // wakes the fiber; the resume is queued on the loop
+		$token->cancel();                                      // cancelled before the fiber runs again
+		try {
+			$future->await();                                  // the fiber re-checks: no final response, and the token is cancelled
+			self::fail('The cancelled token did not end the wait.');
+		} catch (TCancelledException $e) {
+			self::assertSame($token->getReason(), $e);
+		}
+		$stream->mergeHeaders([':status' => '200']);
+		self::assertSame('200', $stream->awaitResponse()[':status'], 'The stream is unaffected.');
+	}
+
+	public function testWaitWritableThrowsATokenCancelledBetweenAPartialDrainAndTheResume()
+	{
+		$this->requireAsync();
+		$stream = $this->stream();
+		$stream->setWriteHighWaterMark(4);
+		$token = new TCancellationToken();
+		$future = TAsync::run(fn () => $stream->writeAsync('abcdefg', $token));
+		$stream->drainOutgoing(1);                             // wakes the fiber with 6 > 4 still queued
+		$token->cancel();
+		try {
+			$future->await();
+			self::fail('The cancelled token did not end the wait.');
+		} catch (TCancelledException $e) {
+			self::assertSame($token->getReason(), $e);
+		}
+		self::assertSame(6, $stream->getOutgoingLength(), 'The bytes stay queued.');
+		$stream->drainOutgoing(6);
+		$stream->waitWritable();                               // no waiter was left behind
 	}
 
 	/** Skips the test when the PRADO 4.4 async API is absent. */

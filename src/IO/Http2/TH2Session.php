@@ -38,12 +38,22 @@ use Revolt\EventLoop\Suspension;
  * provider; an empty open stream defers until {@see resumeStream()} (triggered by a write).
  *
  * Header names are lowercased on submit (RFC 9113 §8.2.1), pseudo-headers are sent first (§8.3),
- * and a name given twice in any letter case throws `http2_header_duplicate`.  A received field that
- * repeats keeps every value: `cookie` rejoins with `; `, any other name combines with `, `.  A
- * client session declines server push (`SETTINGS_ENABLE_PUSH => 0`) when it {@see submitSettings()
- * submits settings}, unless the caller sets that id; a pushed stream has no {@see TH2Stream}, so
- * its frames are discarded.  {@see close()} frees the nghttp2 session; every later nghttp2 call
- * throws `http2_session_closed`.
+ * and a name given twice in any letter case throws `http2_header_duplicate`.  A name that is not a
+ * token, and a value with a CR, LF, or NUL character, throw `http2_header_invalid`.  A received
+ * field that repeats keeps every value: `cookie` rejoins with `; `, any other name combines with
+ * `, `.  A received header block larger than the {@see getMaxHeaderListSize() header list limit}
+ * (64 KiB unless {@see TH2Options::setMaxHeaderListSize()} sets another) is dropped and its stream
+ * reset: nghttp2 does not bound the decoded size of a header block.  A client session declines
+ * server push (`SETTINGS_ENABLE_PUSH => 0`) when it {@see submitSettings() submits settings},
+ * unless the caller sets that id; a pushed stream has no {@see TH2Stream}, so its frames are
+ * discarded.  {@see close()} frees the nghttp2 session and raises {@see onClose} for the streams
+ * still open; every later nghttp2 call throws `http2_session_closed`.
+ *
+ * Flow control is nghttp2's by default: it reopens the peer's window as DATA arrives, so a stream
+ * buffers whatever the peer sends until the application reads it.
+ * {@see TH2Options::setConsumeOnRead()} reopens the window as the application reads instead, which
+ * bounds each stream's buffer at the window.  {@see TH2Options::setNoAutoWindowUpdate()} leaves the
+ * accounting to the application ({@see consume()}).
  *
  * Event handlers run inside nghttp2 callbacks, where PHP cannot throw.  A Throwable raised there
  * (by a handler or by this class) is held while nghttp2 finishes the {@see receive()} or
@@ -83,20 +93,29 @@ use Revolt\EventLoop\Suspension;
  *  - onTrailers: a trailing header block arrived (a second HEADERS on the stream): request trailers
  *    on the server, response trailers (no `:status`) on the client.
  *  - onData: DATA arrived on a stream (read it via the stream).
- *  - onClose: a stream closed.
+ *  - onClose: a stream closed: nghttp2 closed it (completion, a reset), or the session closed with
+ *    the stream still open.
  *
  * Diagnostic events ('on' prefix), raised with the session as sender:
  *  - onFrameSent / onFrameNotSent / onInvalidFrame: an array of `type`, `streamId`, `flags` (and an
- *    nghttp2 `error` code for the latter two).
+ *    nghttp2 `error` code for the latter two).  onInvalidFrame also reports a header block over the
+ *    header list limit, with `error` {@see TNgHttp2::ERR_TEMPORAL_CALLBACK_FAILURE}.
  *  - onSessionError: nghttp2's message string for a session-level error.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 1.0.0
+ * @since 0.9.0
  * @see https://www.rfc-editor.org/rfc/rfc9113.html
  * @see https://www.rfc-editor.org/rfc/rfc8441.html
  */
 class TH2Session extends TComponent
 {
+	/**
+	 * @var int The largest header list a session accepts in one header block when
+	 *   {@see TH2Options::setMaxHeaderListSize()} sets none: 64 KiB.
+	 * @since 1.4.0
+	 */
+	public const DEFAULT_MAX_HEADER_LIST_SIZE = 65536;
+
 	/** @var ?\FFI\CData The nghttp2 callbacks, built once and shared by all sessions. */
 	private static ?\FFI\CData $_callbacks = null;
 
@@ -136,6 +155,9 @@ class TH2Session extends TComponent
 	/** @var array<int, array<string, string>> Headers accumulating per stream during reception. */
 	private array $_pendingHeaders = [];
 
+	/** @var array<int, int> The header list size accumulated per stream during reception (RFC 9113 §6.5.2). */
+	private array $_pendingHeaderSizes = [];
+
 	/** @var bool Whether the session has been closed. */
 	private bool $_closed = false;
 
@@ -169,19 +191,32 @@ class TH2Session extends TComponent
 	/** @var ?Suspension The pump's fiber while it waits for the transport or for output to send. */
 	private ?Suspension $_pumpWaiter = null;
 
-	/** @var string The pump wake reason: the transport is readable. */
+	/**
+	 * @var string The pump wake reason: the transport is readable.
+	 * @since 1.3.0
+	 */
 	private const PUMP_READABLE = 'readable';
 
-	/** @var string The pump wake reason: the transport accepts more of the held output. */
+	/**
+	 * @var string The pump wake reason: the transport accepts more of the held output.
+	 * @since 1.3.0
+	 */
 	private const PUMP_WRITABLE = 'writable';
 
-	/** @var string The pump wake reason: a submit queued output, or the session closed. */
+	/**
+	 * @var string The pump wake reason: a submit queued output, or the session closed.
+	 * @since 1.3.0
+	 */
 	private const PUMP_OUTPUT = 'output';
 
-	/** @var int The bytes the pump reads from the transport per round. */
+	/**
+	 * @var int The bytes the pump reads from the transport per round.
+	 * @since 1.3.0
+	 */
 	private const PUMP_READ_LENGTH = 65536;
 
 	/**
+	 * Creates a server or client session over libnghttp2.
 	 * @param bool $isServer Whether this is the server side. Default true.
 	 * @param ?TH2Options $options Tuning options, or null for nghttp2's defaults.
 	 * @throws THttp2Exception When libnghttp2 is unavailable or the session cannot be created.
@@ -199,61 +234,91 @@ class TH2Session extends TComponent
 	// Self-Encapsulated Accessors
 	// =========================================================================
 
-	/** @return \FFI The bound nghttp2 FFI instance. */
+	/**
+	 * Returns the raw bound nghttp2 FFI instance.
+	 * @return \FFI The bound nghttp2 FFI instance.
+	 */
 	protected function getFfiDirect(): \FFI
 	{
 		return $this->_ffi;
 	}
 
-	/** @param \FFI $value The bound nghttp2 FFI instance. */
+	/**
+	 * Sets the raw bound nghttp2 FFI instance.
+	 * @param \FFI $value The bound nghttp2 FFI instance.
+	 */
 	protected function setFfiDirect(\FFI $value): void
 	{
 		$this->_ffi = $value;
 	}
 
-	/** @return bool Whether this is the server side. */
+	/**
+	 * Returns the raw server-side flag.
+	 * @return bool Whether this is the server side.
+	 */
 	protected function getIsServerDirect(): bool
 	{
 		return $this->_isServer;
 	}
 
-	/** @param bool $value Whether this is the server side. */
+	/**
+	 * Sets the raw server-side flag.
+	 * @param bool $value Whether this is the server side.
+	 */
 	protected function setIsServerDirect(bool $value): void
 	{
 		$this->_isServer = $value;
 	}
 
-	/** @return \FFI\CData The nghttp2_session pointer. */
+	/**
+	 * Returns the raw nghttp2_session pointer.
+	 * @return \FFI\CData The nghttp2_session pointer.
+	 */
 	protected function getSessionDirect(): \FFI\CData
 	{
 		return $this->_session;
 	}
 
-	/** @param \FFI\CData $value The nghttp2_session pointer. */
+	/**
+	 * Sets the raw nghttp2_session pointer.
+	 * @param \FFI\CData $value The nghttp2_session pointer.
+	 */
 	protected function setSessionDirect(\FFI\CData $value): void
 	{
 		$this->_session = $value;
 	}
 
-	/** @return int The routing id. */
+	/**
+	 * Returns the raw routing id.
+	 * @return int The routing id.
+	 */
 	protected function getIdDirect(): int
 	{
 		return $this->_id;
 	}
 
-	/** @param int $value The routing id. */
+	/**
+	 * Sets the raw routing id.
+	 * @param int $value The routing id.
+	 */
 	protected function setIdDirect(int $value): void
 	{
 		$this->_id = $value;
 	}
 
-	/** @return ?\FFI\CData The nghttp2 user_data cell. */
+	/**
+	 * Returns the raw nghttp2 user_data cell.
+	 * @return ?\FFI\CData The nghttp2 user_data cell.
+	 */
 	protected function getUserDataDirect(): ?\FFI\CData
 	{
 		return $this->_userData;
 	}
 
-	/** @param ?\FFI\CData $value The nghttp2 user_data cell. */
+	/**
+	 * Sets the raw nghttp2 user_data cell.
+	 * @param ?\FFI\CData $value The nghttp2 user_data cell.
+	 */
 	protected function setUserDataDirect(?\FFI\CData $value): void
 	{
 		$this->_userData = $value;
@@ -268,7 +333,10 @@ class TH2Session extends TComponent
 		return $this->_streams;
 	}
 
-	/** @param array<int, TH2Stream> $value The open streams. */
+	/**
+	 * Sets the raw open stream map.
+	 * @param array<int, TH2Stream> $value The open streams.
+	 */
 	protected function setStreamsDirect(array $value): void
 	{
 		$this->_streams = $value;
@@ -283,43 +351,86 @@ class TH2Session extends TComponent
 		return $this->_pendingHeaders;
 	}
 
-	/** @param array<int, array<string, string>> $value The pending headers. */
+	/**
+	 * Sets the raw pending header map.
+	 * @param array<int, array<string, string>> $value The pending headers.
+	 */
 	protected function setPendingHeadersDirect(array $value): void
 	{
 		$this->_pendingHeaders = $value;
 	}
 
-	/** @return bool Whether the session is closed. */
+	/**
+	 * Returns the raw pending header list sizes by reference, for in-place mutation.
+	 * @return array<int, int> The accumulated size per stream, by reference.
+	 * @since 1.4.0
+	 */
+	protected function &getPendingHeaderSizesDirect(): array
+	{
+		return $this->_pendingHeaderSizes;
+	}
+
+	/**
+	 * Sets the raw pending header list sizes.
+	 * @param array<int, int> $value The accumulated size per stream.
+	 * @since 1.4.0
+	 */
+	protected function setPendingHeaderSizesDirect(array $value): void
+	{
+		$this->_pendingHeaderSizes = $value;
+	}
+
+	/**
+	 * Returns the raw closed flag.
+	 * @return bool Whether the session is closed.
+	 */
 	protected function getClosedDirect(): bool
 	{
 		return $this->_closed;
 	}
 
-	/** @param bool $value Whether the session is closed. */
+	/**
+	 * Sets the raw closed flag.
+	 * @param bool $value Whether the session is closed.
+	 */
 	protected function setClosedDirect(bool $value): void
 	{
 		$this->_closed = $value;
 	}
 
-	/** @return ?TH2Options The tuning options. */
+	/**
+	 * Returns the raw tuning options.
+	 * @return ?TH2Options The tuning options.
+	 */
 	protected function getOptionsDirect(): ?TH2Options
 	{
 		return $this->_options;
 	}
 
-	/** @param ?TH2Options $value The tuning options. */
+	/**
+	 * Sets the raw tuning options.
+	 * @param ?TH2Options $value The tuning options.
+	 */
 	protected function setOptionsDirect(?TH2Options $value): void
 	{
 		$this->_options = $value;
 	}
 
-	/** @return ?\FFI\CData The data provider this session submits with. */
+	/**
+	 * Returns the raw data provider.
+	 * @return ?\FFI\CData The data provider this session submits with.
+	 * @since 1.0.0
+	 */
 	protected function getDataProviderDirect(): ?\FFI\CData
 	{
 		return $this->_dataProvider;
 	}
 
-	/** @param ?\FFI\CData $value The data provider this session submits with. */
+	/**
+	 * Sets the raw data provider.
+	 * @param ?\FFI\CData $value The data provider this session submits with.
+	 * @since 1.0.0
+	 */
 	protected function setDataProviderDirect(?\FFI\CData $value): void
 	{
 		$this->_dataProvider = $value;
@@ -328,31 +439,45 @@ class TH2Session extends TComponent
 	/**
 	 * Returns the session's callback closures by reference (held alive for the session's life).
 	 * @return array<int, mixed> The callback closures, by reference.
+	 * @since 1.0.0
 	 */
 	protected function &getRefsDirect(): array
 	{
 		return $this->_refs;
 	}
 
-	/** @param array<int, mixed> $value The callback closures. */
+	/**
+	 * Sets the raw callback closures.
+	 * @param array<int, mixed> $value The callback closures.
+	 * @since 1.0.0
+	 */
 	protected function setRefsDirect(array $value): void
 	{
 		$this->_refs = $value;
 	}
 
-	/** @return int The nesting depth of nghttp2 calls in progress. */
+	/**
+	 * Returns the raw nghttp2 call depth.
+	 * @return int The nesting depth of nghttp2 calls in progress.
+	 * @since 1.2.0
+	 */
 	protected function getNativeDepthDirect(): int
 	{
 		return $this->_nativeDepth;
 	}
 
-	/** @param int $value The nesting depth of nghttp2 calls in progress. */
+	/**
+	 * Sets the raw nghttp2 call depth.
+	 * @param int $value The nesting depth of nghttp2 calls in progress.
+	 * @since 1.2.0
+	 */
 	protected function setNativeDepthDirect(int $value): void
 	{
 		$this->_nativeDepth = $value;
 	}
 
 	/**
+	 * Returns the raw sending flag.
 	 * @return bool Whether a send() is draining nghttp2's output.
 	 * @since 1.3.0
 	 */
@@ -362,6 +487,7 @@ class TH2Session extends TComponent
 	}
 
 	/**
+	 * Sets the raw sending flag.
 	 * @param bool $value Whether a send() is draining nghttp2's output.
 	 * @since 1.3.0
 	 */
@@ -370,43 +496,68 @@ class TH2Session extends TComponent
 		$this->_sending = $value;
 	}
 
-	/** @return bool Whether the nghttp2 session waits to be freed after the current call. */
+	/**
+	 * Returns the raw close-pending flag.
+	 * @return bool Whether the nghttp2 session waits to be freed after the current call.
+	 * @since 1.2.0
+	 */
 	protected function getClosePendingDirect(): bool
 	{
 		return $this->_closePending;
 	}
 
-	/** @param bool $value Whether the nghttp2 session waits to be freed after the current call. */
+	/**
+	 * Sets the raw close-pending flag.
+	 * @param bool $value Whether the nghttp2 session waits to be freed after the current call.
+	 * @since 1.2.0
+	 */
 	protected function setClosePendingDirect(bool $value): void
 	{
 		$this->_closePending = $value;
 	}
 
-	/** @return ?\Throwable The first Throwable a callback raised during the current nghttp2 call. */
+	/**
+	 * Returns the raw held Throwable.
+	 * @return ?\Throwable The first Throwable a callback raised during the current nghttp2 call.
+	 * @since 1.2.0
+	 */
 	protected function getPendingThrowableDirect(): ?\Throwable
 	{
 		return $this->_pendingThrowable;
 	}
 
-	/** @param ?\Throwable $value The Throwable to rethrow once the nghttp2 call returns. */
+	/**
+	 * Sets the raw held Throwable.
+	 * @param ?\Throwable $value The Throwable to rethrow once the nghttp2 call returns.
+	 * @since 1.2.0
+	 */
 	protected function setPendingThrowableDirect(?\Throwable $value): void
 	{
 		$this->_pendingThrowable = $value;
 	}
 
-	/** @return string The bytes produced by a send() that rethrew, still to be returned. */
+	/**
+	 * Returns the raw unsent output.
+	 * @return string The bytes produced by a send() that rethrew, still to be returned.
+	 * @since 1.2.0
+	 */
 	protected function getUnsentOutputDirect(): string
 	{
 		return $this->_unsentOutput;
 	}
 
-	/** @param string $value The bytes produced by a send() that rethrew, still to be returned. */
+	/**
+	 * Sets the raw unsent output.
+	 * @param string $value The bytes produced by a send() that rethrew, still to be returned.
+	 * @since 1.2.0
+	 */
 	protected function setUnsentOutputDirect(string $value): void
 	{
 		$this->_unsentOutput = $value;
 	}
 
 	/**
+	 * Returns the raw pumping flag.
 	 * @return bool Whether a fiber is inside {@see pump()}.
 	 * @since 1.3.0
 	 */
@@ -416,6 +567,7 @@ class TH2Session extends TComponent
 	}
 
 	/**
+	 * Sets the raw pumping flag.
 	 * @param bool $value Whether a fiber is inside {@see pump()}.
 	 * @since 1.3.0
 	 */
@@ -425,6 +577,7 @@ class TH2Session extends TComponent
 	}
 
 	/**
+	 * Returns the raw pump's suspension.
 	 * @return ?Suspension The pump's suspension while it waits, or null.
 	 * @since 1.3.0
 	 */
@@ -434,6 +587,7 @@ class TH2Session extends TComponent
 	}
 
 	/**
+	 * Sets the raw pump's suspension.
 	 * @param ?Suspension $value The pump's suspension while it waits, or null.
 	 * @since 1.3.0
 	 */
@@ -481,7 +635,8 @@ class TH2Session extends TComponent
 			$streamId = $frame->stream_id;
 			$name = \FFI::string($name, $namelen);
 			$value = \FFI::string($value, $valuelen);
-			return $self->guarded(fn () => $self->handleHeader($streamId, $name, $value));
+			// A header list over the limit, or a failure here, resets this stream and keeps the session.
+			return $self->guarded(fn () => $self->handleHeader($streamId, $name, $value), TNgHttp2::ERR_TEMPORAL_CALLBACK_FAILURE);
 		};
 		$onFrameRecv = static function ($session, $frame, $userData) use ($ffi) {
 			$self = self::fromUserData($ffi, $userData);
@@ -633,7 +788,7 @@ class TH2Session extends TComponent
 		if ($options->getPeerMaxConcurrentStreams() !== null) {
 			$ffi->nghttp2_option_set_peer_max_concurrent_streams($option, $options->getPeerMaxConcurrentStreams());
 		}
-		if ($options->getNoAutoWindowUpdate()) {
+		if ($options->getNoAutoWindowUpdate() || $options->getConsumeOnRead()) {
 			$ffi->nghttp2_option_set_no_auto_window_update($option, 1);
 		}
 		return $option;
@@ -645,7 +800,10 @@ class TH2Session extends TComponent
 
 	/**
 	 * Submits connection SETTINGS (e.g. {@see TNgHttp2::SETTINGS_ENABLE_CONNECT_PROTOCOL}).  A client
-	 * adds `SETTINGS_ENABLE_PUSH => 0` unless the caller gives that id.
+	 * adds `SETTINGS_ENABLE_PUSH => 0` unless the caller gives that id.  The session's
+	 * {@see getMaxHeaderListSize() header list limit} is advertised as `SETTINGS_MAX_HEADER_LIST_SIZE`
+	 * unless the caller gives that id or the limit is off.  The advertised value is advisory to the
+	 * peer; the limit this session enforces comes from {@see TH2Options::setMaxHeaderListSize()}.
 	 * @param array<int, int> $settings The settings as id => value.
 	 * @throws THttp2Exception When the submission fails.
 	 */
@@ -655,6 +813,10 @@ class TH2Session extends TComponent
 		if (!$this->getIsServerDirect() && !array_key_exists(TNgHttp2::SETTINGS_ENABLE_PUSH, $settings)) {
 			// A pushed stream has no TH2Stream and is discarded, so a client declines push (RFC 9113 §8.4).
 			$settings[TNgHttp2::SETTINGS_ENABLE_PUSH] = 0;
+		}
+		$limit = $this->getMaxHeaderListSize();
+		if ($limit > 0 && !array_key_exists(TNgHttp2::SETTINGS_MAX_HEADER_LIST_SIZE, $settings)) {
+			$settings[TNgHttp2::SETTINGS_MAX_HEADER_LIST_SIZE] = min($limit, 0xFFFFFFFF);
 		}
 		$ffi = $this->getFfiDirect();
 		$count = count($settings);
@@ -670,6 +832,22 @@ class TH2Session extends TComponent
 			throw new THttp2Exception('http2_session_failed', TNgHttp2::strerror($result));
 		}
 		$this->outputChanged();
+	}
+
+	/**
+	 * Returns the largest header list this session accepts in one received header block: request
+	 * headers, response headers, or trailers.  The size is the sum over the fields of name length,
+	 * value length, and 32 (RFC 9113 §6.5.2).  A block over the limit is dropped, its stream is reset
+	 * (RST_STREAM INTERNAL_ERROR), and {@see onInvalidFrame} is raised; the session stays usable.
+	 * nghttp2 does not enforce `SETTINGS_MAX_HEADER_LIST_SIZE`, and HPACK lets a few kilobytes on the
+	 * wire decode to hundreds of megabytes, so the session enforces the limit itself.
+	 * @return int The limit in bytes ({@see TH2Options::setMaxHeaderListSize()}, else
+	 *   {@see DEFAULT_MAX_HEADER_LIST_SIZE}), or 0 for no limit.
+	 * @since 1.4.0
+	 */
+	public function getMaxHeaderListSize(): int
+	{
+		return $this->getOptionsDirect()?->getMaxHeaderListSize() ?? self::DEFAULT_MAX_HEADER_LIST_SIZE;
 	}
 
 	/**
@@ -734,7 +912,8 @@ class TH2Session extends TComponent
 	 * Opens a client request stream with the given headers (including pseudo-headers).  Names are
 	 * lowercased and pseudo-headers go first; the stream keeps the headers in that form.
 	 * @param array<string, string> $headers The request headers (e.g. ':method' => 'CONNECT').
-	 * @throws THttp2Exception When a name repeats or the request cannot be submitted.
+	 * @throws THttp2Exception When a name repeats or is not valid, a value is not valid, or the
+	 *   request cannot be submitted.
 	 * @return TH2Stream The new stream.
 	 */
 	public function request(array $headers): TH2Stream
@@ -748,6 +927,7 @@ class TH2Session extends TComponent
 			throw new THttp2Exception('http2_session_failed', TNgHttp2::strerror($streamId));
 		}
 		$stream = Prado::createComponent(TH2Stream::class, $this, $streamId, $headers);
+		$stream->markHeadersSubmitted();
 		$streams = &$this->getStreamsDirect();
 		$streams[$streamId] = $stream;
 		$this->outputChanged();
@@ -758,7 +938,8 @@ class TH2Session extends TComponent
 	 * Sends response headers on a server stream, accepting it (e.g. ':status' => '200').
 	 * @param TH2Stream $stream The request stream to respond on.
 	 * @param array<string, string> $headers The response headers.
-	 * @throws THttp2Exception When a name repeats or the response cannot be submitted.
+	 * @throws THttp2Exception When a name repeats or is not valid, a value is not valid, or the
+	 *   response cannot be submitted.
 	 */
 	public function respond(TH2Stream $stream, array $headers): void
 	{
@@ -770,6 +951,7 @@ class TH2Session extends TComponent
 		if ($result !== 0) {
 			throw new THttp2Exception('http2_session_failed', TNgHttp2::strerror($result));
 		}
+		$stream->markHeadersSubmitted();
 		$this->outputChanged();
 	}
 
@@ -779,7 +961,9 @@ class TH2Session extends TComponent
 	 * the body without END_STREAM so the trailers carry it.
 	 * @param int $streamId The stream identifier.
 	 * @param array<string, string> $headers The trailing header name => value pairs.
-	 * @throws THttp2Exception When a name repeats or the trailers cannot be submitted.
+	 * @throws THttp2Exception When a name repeats or is not valid, a value is not valid, or the
+	 *   trailers cannot be submitted.
+	 * @since 1.0.0
 	 */
 	public function submitTrailers(int $streamId, array $headers): void
 	{
@@ -881,8 +1065,9 @@ class TH2Session extends TComponent
 	 * peer misses nothing.  A send() from inside a {@see receive()} handler is allowed; one from
 	 * inside a send() handler (`onFrameSent`), or from the event loop or another fiber while such a
 	 * handler is suspended, throws `http2_session_busy`.
-	 * @throws THttp2Exception When nghttp2 fails to produce output, or `http2_session_busy` when
-	 *   another send() on this session is in progress.
+	 * @throws THttp2Exception When nghttp2 fails to produce output (the bytes drained before the
+	 *   failure are kept for the next send()), or `http2_session_busy` when another send() on this
+	 *   session is in progress.
 	 * @throws \Throwable The first Throwable an event handler or data provider raised while the
 	 *   bytes were produced; the session stays usable.
 	 * @return string The bytes to write to the transport ('' when none).
@@ -906,6 +1091,7 @@ class TH2Session extends TComponent
 				$pointer = $ffi->new('uint8_t*');
 				$count = $this->nativeCall(fn () => $ffi->nghttp2_session_mem_send2($session, \FFI::addr($pointer)));
 				if ($count < 0) {
+					$this->setUnsentOutputDirect($output);   // what was drained before the failure is not lost
 					throw new THttp2Exception('http2_session_send_failed', TNgHttp2::strerror($count));
 				}
 				if ($count === 0) {
@@ -928,6 +1114,7 @@ class TH2Session extends TComponent
 	 * requested inside a callback frees the nghttp2 session only after the outermost call returns.
 	 * @param \Closure $call The nghttp2 call.
 	 * @return mixed The call's result.
+	 * @since 1.2.0
 	 */
 	private function nativeCall(\Closure $call): mixed
 	{
@@ -946,6 +1133,7 @@ class TH2Session extends TComponent
 	/**
 	 * Rethrows the first Throwable a callback held back, once no nghttp2 call is in progress.
 	 * @throws \Throwable The held Throwable.
+	 * @since 1.2.0
 	 */
 	private function rethrowPending(): void
 	{
@@ -963,6 +1151,7 @@ class TH2Session extends TComponent
 	 * @param \Closure $body The callback body; an int result is returned to nghttp2 (void → 0).
 	 * @param int $failure The nghttp2 return code on a Throwable. Default 0 (continue).
 	 * @return int The code returned to nghttp2.
+	 * @since 1.2.0
 	 */
 	private function guarded(\Closure $body, int $failure = 0): int
 	{
@@ -1007,7 +1196,10 @@ class TH2Session extends TComponent
 	 * fiber, where it runs the loop until it returns.  The transport's inner stream must own an open
 	 * PHP stream resource, such as a `TSocketStream`.  A Throwable an event handler raised, or a
 	 * cancelled token, leaves the pump with the session still usable and the held output kept for
-	 * the next {@see send()}, so the pump can be called again.
+	 * the next {@see send()}, so the pump can be called again.  An nghttp2 failure in receive() (a
+	 * peer that does not speak HTTP/2) leaves the pump as a `THttp2Exception` with the session still
+	 * open; the caller closes it.  When the pump closes the session, {@see onClose} is raised for the
+	 * streams still open.
 	 * @param TAsyncStream $transport The transport over the connection.
 	 * @param ?TCancellationToken $token A token whose cancellation ends the pump; the session stays open.
 	 * @throws THttp2Exception `http2_pump_in_progress` when a fiber already pumps the session,
@@ -1071,6 +1263,7 @@ class TH2Session extends TComponent
 	 * @param string $output The bytes to write.
 	 * @return string The bytes the transport did not accept ('' when all were written).
 	 * @phpstan-impure
+	 * @since 1.3.0
 	 */
 	private function writeTransport(IResource&StreamInterface $inner, string $output): string
 	{
@@ -1091,6 +1284,7 @@ class TH2Session extends TComponent
 	 * @param IResource&StreamInterface $inner The transport's inner stream.
 	 * @return string The bytes read ('' when none, or when the session was closed).
 	 * @phpstan-impure
+	 * @since 1.3.0
 	 */
 	private function readTransport(IResource&StreamInterface $inner): string
 	{
@@ -1114,6 +1308,7 @@ class TH2Session extends TComponent
 	 * @param ?TCancellationToken $token A token whose cancellation ends the wait.
 	 * @throws TCancelledException When the token is cancelled.
 	 * @return string The wake reason: {@see PUMP_READABLE}, {@see PUMP_WRITABLE}, or {@see PUMP_OUTPUT}.
+	 * @since 1.3.0
 	 */
 	private function awaitTransport(IResource $resource, bool $writable, ?TCancellationToken $token): string
 	{
@@ -1154,6 +1349,7 @@ class TH2Session extends TComponent
 	 * Resumes a waiting {@see pump()} with a reason.  The loop resumes it on its next iteration, so
 	 * a wake from inside an nghttp2 callback switches no fiber there.
 	 * @param string $reason {@see PUMP_READABLE}, {@see PUMP_WRITABLE}, or {@see PUMP_OUTPUT}.
+	 * @since 1.3.0
 	 */
 	private function wakePump(string $reason): void
 	{
@@ -1167,6 +1363,7 @@ class TH2Session extends TComponent
 	/**
 	 * Notes that a submit may have queued output: a waiting {@see pump()} flushes it.  Called at the
 	 * end of every submit.
+	 * @since 1.3.0
 	 */
 	private function outputChanged(): void
 	{
@@ -1243,7 +1440,9 @@ class TH2Session extends TComponent
 
 	/**
 	 * Tells nghttp2 that the application consumed bytes, advancing flow control (manual mode only,
-	 * see {@see TH2Options::setNoAutoWindowUpdate()}).
+	 * see {@see TH2Options::setNoAutoWindowUpdate()}).  Under
+	 * {@see TH2Options::setConsumeOnRead() ConsumeOnRead} the streams report their reads themselves
+	 * and the application does not call this.
 	 * @param int $streamId The stream identifier.
 	 * @param int $size The number of bytes consumed.
 	 * @throws THttp2Exception When the consume call fails.
@@ -1258,6 +1457,31 @@ class TH2Session extends TComponent
 		$this->outputChanged();
 	}
 
+	/**
+	 * Reports received DATA bytes the application has read, under
+	 * {@see TH2Options::setConsumeOnRead() ConsumeOnRead}: nghttp2 counts them as consumed and
+	 * reopens the peer's window with a WINDOW_UPDATE once enough are.  Called by {@see TH2Stream}
+	 * as it returns bytes from a read, and with $streamId 0 for bytes left unread when a stream
+	 * closes (only the connection window gets them back).  Without ConsumeOnRead, on a closed session,
+	 * or for no bytes it does nothing.  Best-effort, as {@see resumeStream()} is.
+	 * @param int $streamId The stream identifier, or 0 for the connection window only.
+	 * @param int $size The number of bytes read.
+	 * @since 1.4.0
+	 */
+	public function consumeReceived(int $streamId, int $size): void
+	{
+		if ($size <= 0 || $this->getClosedDirect() || !$this->getOptionsDirect()?->getConsumeOnRead()) {
+			return;
+		}
+		$ffi = $this->getFfiDirect();
+		if ($streamId > 0) {
+			$ffi->nghttp2_session_consume($this->getSessionDirect(), $streamId, $size);
+		} else {
+			$ffi->nghttp2_session_consume_connection($this->getSessionDirect(), $size);
+		}
+		$this->outputChanged();
+	}
+
 	// =========================================================================
 	// Lifecycle
 	// =========================================================================
@@ -1265,37 +1489,70 @@ class TH2Session extends TComponent
 	/**
 	 * Closes the session, freeing the nghttp2 session and unregistering it.  Streams still open are
 	 * marked closed in both directions ({@see TH2Stream::markClosed()}): their buffered bytes stay
-	 * readable and a write throws.  Every later nghttp2 call on the session throws
-	 * `http2_session_closed`.  Called from inside an event handler (so while nghttp2 is executing),
-	 * the PHP side closes at once and the nghttp2 session is freed when the {@see receive()} or
-	 * {@see send()} in progress returns.  The shared callbacks and data provider are process-wide
-	 * and are not freed here.
+	 * readable and a write throws.  {@see onClose} is then raised for each of them, as it is when
+	 * nghttp2 closes a stream, so a handler learns of a connection that ended with streams open (the
+	 * {@see pump()} closes the session when the transport ends).  The session is already closed when
+	 * the handlers run; the first Throwable one raises is rethrown after every stream was reported.
+	 * Every later nghttp2 call on the session throws `http2_session_closed`.  Called from inside an
+	 * event handler (so while nghttp2 is executing), the PHP side closes at once and the nghttp2
+	 * session is freed when the {@see receive()} or {@see send()} in progress returns.  The shared
+	 * callbacks and data provider are process-wide and are not freed here.
+	 * @throws \Throwable The first Throwable an `onClose` handler raised.
 	 */
 	public function close(): void
+	{
+		$this->closeSession(true);
+	}
+
+	/**
+	 * Closes the session ({@see close()}), raising {@see onClose} for the streams still open only
+	 * when asked: the destructor closes without events.
+	 * @param bool $raise Whether to raise onClose for each stream still open.
+	 * @throws \Throwable The first Throwable an `onClose` handler raised.
+	 * @since 1.4.0
+	 */
+	private function closeSession(bool $raise): void
 	{
 		if ($this->getClosedDirect()) {
 			return;
 		}
 		$this->setClosedDirect(true);
 		unset(self::$_registry[$this->getIdDirect()]);
-		foreach ($this->getStreamsDirect() as $stream) {
+		$streams = $this->getStreamsDirect();
+		foreach ($streams as $stream) {
 			$stream->markClosed();
 		}
 		$this->setStreamsDirect([]);
 		$this->setPendingHeadersDirect([]);
+		$this->setPendingHeaderSizesDirect([]);
 		$this->setUnsentOutputDirect('');
 		$this->wakePump(self::PUMP_OUTPUT);   // a waiting pump() returns
 		if ($this->getNativeDepthDirect() > 0) {
 			// nghttp2 is executing this session: freeing it now would be a use-after-free.
 			$this->setClosePendingDirect(true);
+		} else {
+			$this->freeSession();
+		}
+		if (!$raise) {
 			return;
 		}
-		$this->freeSession();
+		$first = null;
+		foreach ($streams as $stream) {
+			try {
+				$this->onClose($stream);
+			} catch (\Throwable $e) {
+				$first ??= $e;   // the other streams are still reported
+			}
+		}
+		if ($first !== null) {
+			throw $first;
+		}
 	}
 
 	/**
 	 * Frees the nghttp2 session and drops the per-session callback plumbing.  Runs from
 	 * {@see close()}, or from {@see nativeCall()} when close() was requested inside a callback.
+	 * @since 1.2.0
 	 */
 	private function freeSession(): void
 	{
@@ -1307,13 +1564,14 @@ class TH2Session extends TComponent
 	}
 
 	/**
-	 * Frees the nghttp2 session if it was not closed explicitly.  {@see close()} is idempotent and
-	 * best-effort here (it is skipped if the FFI binding is already gone, e.g. during shutdown).
+	 * Frees the nghttp2 session if it was not closed explicitly.  The close is idempotent and
+	 * best-effort here (it is skipped if the FFI binding is already gone, e.g. during shutdown), and
+	 * raises no {@see onClose}: no handler runs while the session is collected.
 	 */
 	public function __destruct()
 	{
 		try {
-			$this->close();
+			$this->closeSession(false);
 		} catch (\Throwable $e) {
 			// best-effort cleanup
 		}
@@ -1324,6 +1582,7 @@ class TH2Session extends TComponent
 	 * Throws when the session is closed.  {@see close()} frees the nghttp2 session, so a later
 	 * nghttp2 call would touch freed memory.
 	 * @throws THttp2Exception When the session is closed.
+	 * @since 1.1.0
 	 */
 	private function assertOpen(): void
 	{
@@ -1344,24 +1603,53 @@ class TH2Session extends TComponent
 	{
 		$pending = &$this->getPendingHeadersDirect();
 		$pending[$streamId] = [];
+		$sizes = &$this->getPendingHeaderSizesDirect();
+		$sizes[$streamId] = 0;
+	}
+
+	/**
+	 * Forgets the header block a stream has accumulated, with its size.
+	 * @param int $streamId The stream identifier.
+	 * @since 1.4.0
+	 */
+	private function dropPendingHeaders(int $streamId): void
+	{
+		$pending = &$this->getPendingHeadersDirect();
+		unset($pending[$streamId]);
+		$sizes = &$this->getPendingHeaderSizesDirect();
+		unset($sizes[$streamId]);
 	}
 
 	/**
 	 * Records one received header for a stream.  A repeated name keeps every value: `cookie`
 	 * crumbs rejoin with `; ` (RFC 9113 §8.2.3) and any other field combines with `, `
-	 * (RFC 9110 §5.3).
+	 * (RFC 9110 §5.3).  The block's header list size grows by name length, value length, and 32
+	 * (RFC 9113 §6.5.2).  Once it passes {@see getMaxHeaderListSize()} the block is dropped,
+	 * {@see onInvalidFrame} is raised with `error` {@see TNgHttp2::ERR_TEMPORAL_CALLBACK_FAILURE}, and
+	 * that code is returned: nghttp2 resets the stream and reports none of the block's later fields.
 	 * @param int $streamId The stream identifier.
 	 * @param string $name The header name.
 	 * @param string $value The header value.
+	 * @return int 0 to continue, or {@see TNgHttp2::ERR_TEMPORAL_CALLBACK_FAILURE} to reset the stream.
 	 */
-	private function handleHeader(int $streamId, string $name, string $value): void
+	private function handleHeader(int $streamId, string $name, string $value): int
 	{
+		$sizes = &$this->getPendingHeaderSizesDirect();
+		$size = ($sizes[$streamId] ?? 0) + strlen($name) + strlen($value) + 32;
+		$limit = $this->getMaxHeaderListSize();
+		if ($limit > 0 && $size > $limit) {
+			$this->dropPendingHeaders($streamId);
+			$this->onInvalidFrame(['type' => TNgHttp2::FRAME_HEADERS, 'streamId' => $streamId, 'flags' => 0, 'error' => TNgHttp2::ERR_TEMPORAL_CALLBACK_FAILURE]);
+			return TNgHttp2::ERR_TEMPORAL_CALLBACK_FAILURE;
+		}
+		$sizes[$streamId] = $size;
 		$pending = &$this->getPendingHeadersDirect();
 		if (isset($pending[$streamId][$name])) {
 			$pending[$streamId][$name] .= ($name === 'cookie' ? '; ' : ', ') . $value;
 		} else {
 			$pending[$streamId][$name] = $value;
 		}
+		return 0;
 	}
 
 	/**
@@ -1375,9 +1663,8 @@ class TH2Session extends TComponent
 		$streamId = $frame->stream_id;
 		$endStream = ($frame->flags & TNgHttp2::FLAG_END_STREAM) !== 0;
 		if ($frame->type === TNgHttp2::FRAME_HEADERS) {
-			$pending = &$this->getPendingHeadersDirect();
-			$headers = $pending[$streamId] ?? [];
-			unset($pending[$streamId]);
+			$headers = $this->getPendingHeadersDirect()[$streamId] ?? [];
+			$this->dropPendingHeaders($streamId);
 			$streams = &$this->getStreamsDirect();
 			if ($this->getIsServerDirect()) {
 				$stream = $streams[$streamId] ?? null;
@@ -1442,30 +1729,33 @@ class TH2Session extends TComponent
 	 * resets such a stream and reports it here and in on_stream_close; older versions end the
 	 * connection with GOAWAY instead, and {@see close()} drops the block with the session.
 	 * @param array{type: int, streamId: int, flags: int, error: int} $info The frame summary.
+	 * @since 1.2.0
 	 */
 	private function handleInvalidFrame(array $info): void
 	{
-		$pending = &$this->getPendingHeadersDirect();
-		unset($pending[$info['streamId']]);
+		$this->dropPendingHeaders($info['streamId']);
 		$this->onInvalidFrame($info);
 	}
 
 	/**
 	 * Handles a closed stream: marks both directions closed, raises {@see onClose}, and forgets it
-	 * along with any header block it left unfinished (a stream reset mid-HEADERS).
+	 * along with any header block it left unfinished (a stream reset mid-HEADERS).  The stream is
+	 * forgotten when a handler throws as well.
 	 * @param int $streamId The stream identifier.
 	 * @return int Always 0 (continue).
 	 */
 	private function handleStreamClose(int $streamId): int
 	{
-		$pending = &$this->getPendingHeadersDirect();
-		unset($pending[$streamId]);
-		$streams = &$this->getStreamsDirect();
-		$stream = $streams[$streamId] ?? null;
+		$this->dropPendingHeaders($streamId);
+		$stream = $this->getStreamsDirect()[$streamId] ?? null;
 		if ($stream !== null) {
 			$stream->markClosed();
-			$this->onClose($stream);
-			unset($streams[$streamId]);
+			try {
+				$this->onClose($stream);
+			} finally {
+				$streams = &$this->getStreamsDirect();
+				unset($streams[$streamId]);
+			}
 		}
 		return 0;
 	}
@@ -1510,9 +1800,14 @@ class TH2Session extends TComponent
 	 * field names are lowercase (RFC 9113 §8.2.1; nghttp2 rejects an uppercase name) and a
 	 * pseudo-header after a regular field is malformed (§8.3): nghttp2 submits it and the peer resets
 	 * the stream.
+	 * A name that is not a token (with one leading colon for a pseudo-header) and a value with a CR,
+	 * LF, or NUL character are rejected (§8.2.1): nghttp2 would send them, and a peer either drops
+	 * the field without notice or treats the message as malformed.
 	 * @param array<string, string> $headers The header name => value pairs as given.
-	 * @throws THttp2Exception `http2_header_duplicate` when two names differ only by letter case.
+	 * @throws THttp2Exception `http2_header_duplicate` when two names differ only by letter case;
+	 *   `http2_header_invalid` for a name or a value HTTP/2 forbids.
 	 * @return array<string, string> The normalized headers, pseudo-headers first.
+	 * @since 1.2.0
 	 */
 	private function normalizeHeaders(array $headers): array
 	{
@@ -1520,13 +1815,20 @@ class TH2Session extends TComponent
 		$regular = [];
 		foreach ($headers as $name => $value) {
 			$name = strtolower((string) $name);
+			$value = (string) $value;
 			if (isset($pseudo[$name]) || isset($regular[$name])) {
 				throw new THttp2Exception('http2_header_duplicate', $name);
 			}
-			if ($name !== '' && $name[0] === ':') {
-				$pseudo[$name] = (string) $value;
+			if (preg_match('/^:?[!#$%&\'*+\-.^_`|~0-9a-z]+$/D', $name) !== 1) {
+				throw new THttp2Exception('http2_header_invalid', addcslashes($name, "\0..\37\177..\377"), 'the name is not a token');
+			}
+			if (strpbrk($value, "\r\n\0") !== false) {
+				throw new THttp2Exception('http2_header_invalid', $name, 'the value holds a CR, LF, or NUL character');
+			}
+			if ($name[0] === ':') {
+				$pseudo[$name] = $value;
 			} else {
-				$regular[$name] = (string) $value;
+				$regular[$name] = $value;
 			}
 		}
 		return $pseudo + $regular;
@@ -1599,6 +1901,7 @@ class TH2Session extends TComponent
 	 * Raised when a client receives a 1xx informational response (e.g. 100 Continue, 103 Early
 	 * Hints) before the final response.  The stream stays open; {@see onResponse} follows.
 	 * @param TH2Stream $stream The stream carrying the informational response.
+	 * @since 1.0.0
 	 */
 	public function onInformationalResponse(TH2Stream $stream): void
 	{
@@ -1610,6 +1913,7 @@ class TH2Session extends TComponent
 	 * body.  A server receives request trailers; a client receives response trailers (no `:status`).
 	 * The trailers are merged into the stream's headers.
 	 * @param TH2Stream $stream The stream carrying the trailers.
+	 * @since 1.0.0
 	 */
 	public function onTrailers(TH2Stream $stream): void
 	{
@@ -1626,7 +1930,9 @@ class TH2Session extends TComponent
 	}
 
 	/**
-	 * Raised when a stream closes.
+	 * Raised when a stream closes: nghttp2 closed it (both sides finished, or a reset), or
+	 * {@see close()} closed the session while the stream was open.  In the second case the session
+	 * is already closed when the handler runs.
 	 * @param TH2Stream $stream The closed stream.
 	 */
 	public function onClose(TH2Stream $stream): void
@@ -1653,7 +1959,9 @@ class TH2Session extends TComponent
 	}
 
 	/**
-	 * Raised when an invalid frame is received (a protocol violation by the peer).
+	 * Raised when an invalid frame is received (a protocol violation by the peer), and when a header
+	 * block exceeds the {@see getMaxHeaderListSize() header list limit} (`type`
+	 * {@see TNgHttp2::FRAME_HEADERS}, `error` {@see TNgHttp2::ERR_TEMPORAL_CALLBACK_FAILURE}).
 	 * @param mixed $param An array of `type`, `streamId`, `flags`, and the nghttp2 `error` code.
 	 */
 	public function onInvalidFrame(mixed $param): void

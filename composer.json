@@ -36,14 +36,14 @@
 	],
 	"require": {
 		"php": ">=8.2.0",
-		"ext-ffi": "*"
+		"ext-ffi": "*",
+		"pradosoft/prado": "^4.4@dev"
 	},
 	"suggest": {
 		"ext-openssl": "TLS with ALPN 'h2' for HTTP/2 over TLS.",
 		"lib-nghttp2": "The system libnghttp2 shared library, bound via FFI for HTTP/2 framing, HPACK, and flow control."
 	},
 	"require-dev" : {
-		"pradosoft/prado" : "^4.4",
 		"phpunit/phpunit" : "^10",
 		"phpdocumentor/shim": "^3",
 		"friendsofphp/php-cs-fixer": "3.95.27",
@@ -59,7 +59,19 @@
 	},
 	"scripts": {
 		"unittest": "vendor/bin/phpunit --testsuite unit",
-		"functest": "vendor/bin/phpunit --testsuite functional"
+		"functest": "vendor/bin/phpunit --testsuite functional",
+		"coverage": [
+			"@putenv XDEBUG_MODE=coverage",
+			"vendor/bin/phpunit --testsuite unit,functional --coverage-text"
+		],
+		"coverage-path": [
+			"@putenv XDEBUG_MODE=coverage",
+			"vendor/bin/phpunit --testsuite unit,functional --coverage-text --path-coverage"
+		],
+		"coverage-html": [
+			"@putenv XDEBUG_MODE=coverage",
+			"vendor/bin/phpunit --testsuite unit,functional --coverage-html build/coverage --path-coverage"
+		]
 	},
 	"extra": {
 		"prado": {

@@ -31,8 +31,8 @@ use Revolt\EventLoop\Suspension;
  * have arrived yet.  The stream is at {@see eof()} once the peer half-closes and the buffer is
  * drained.  {@see markLocalClosed()} finishes a finite body: the queued bytes flush and the
  * stream then ends (END_STREAM).  {@see close()} discards the buffers, detaches the stream, and
- * ends it on the wire: a peer that is still sending is cancelled (RST_STREAM CANCEL); otherwise
- * this side ends (END_STREAM).  Once nghttp2 closes the stream (peer reset, completion, or
+ * ends it on the wire: a peer that is still sending, and a request this server never answered, are
+ * cancelled (RST_STREAM CANCEL); otherwise this side ends (END_STREAM).  Once nghttp2 closes the stream (peer reset, completion, or
  * session close) the session marks both directions closed: buffered bytes stay readable, a write
  * throws.  A {@see read()}, {@see getContents()}, or {@see write()} on a detached stream throws,
  * per PSR-7.
@@ -52,6 +52,12 @@ use Revolt\EventLoop\Suspension;
  * arrive (a `:status` other than 1xx).  One fiber waits per condition; a second concurrent wait
  * of the same kind throws.
  *
+ * Under automatic flow control (the default) nghttp2 reopens the peer's window as DATA arrives, so
+ * the incoming buffer holds whatever the peer sends until it is read.  With
+ * {@see TH2Options::setConsumeOnRead() ConsumeOnRead} each read reports its bytes to the session
+ * ({@see TH2Session::consumeReceived()}) and the window reopens only then, so the buffer holds at
+ * most the window.  {@see getIncomingLength()} is the buffered byte count.
+ *
  * State is self-encapsulated: every field is reached through a protected `get*Direct()`/
  * `set*Direct()` accessor (the byte buffers return by reference), so a subclass can intercept
  * any of it.  Each buffer is consumed from the front through an offset (`IncomingOffset`,
@@ -59,7 +65,7 @@ use Revolt\EventLoop\Suspension;
  * linear.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 1.0.0
+ * @since 0.9.0
  * @see https://www.rfc-editor.org/rfc/rfc9113.html
  */
 class TH2Stream extends TComponent implements StreamInterface
@@ -82,7 +88,10 @@ class TH2Stream extends TComponent implements StreamInterface
 	 */
 	public const WAIT_RESPONSE = 'response';
 
-	/** @var int The consumed prefix length at which a buffer is compacted (once it is at least half consumed). */
+	/**
+	 * @var int The consumed prefix length at which a buffer is compacted (once it is at least half consumed).
+	 * @since 1.2.0
+	 */
 	private const COMPACT_THRESHOLD = 1048576;
 
 	/** @var TH2Session The owning session. */
@@ -130,7 +139,14 @@ class TH2Stream extends TComponent implements StreamInterface
 	/** @var ?int The queued outgoing byte count above which {@see writeAsync()} waits, or null for the peer's window. */
 	private ?int $_writeHighWaterMark = null;
 
+	/** @var bool Whether this side's HEADERS were submitted (a client request, or a server response). */
+	private bool $_headersSubmitted = false;
+
+	/** @var bool Whether the buffered incoming bytes were already reported to the session as consumed. */
+	private bool $_incomingReleased = false;
+
 	/**
+	 * Creates the stream of one HTTP/2 stream id on a session.
 	 * @param TH2Session $session The owning session.
 	 * @param int $streamId The HTTP/2 stream identifier.
 	 * @param array<string, string> $headers The stream's headers, including pseudo-headers.
@@ -302,6 +318,7 @@ class TH2Stream extends TComponent implements StreamInterface
 	/**
 	 * Returns the raw detached flag.
 	 * @return bool Whether the stream has been closed or detached.
+	 * @since 1.0.0
 	 */
 	protected function getDetachedDirect(): bool
 	{
@@ -311,6 +328,7 @@ class TH2Stream extends TComponent implements StreamInterface
 	/**
 	 * Sets the raw detached flag.
 	 * @param bool $value Whether the stream has been closed or detached.
+	 * @since 1.0.0
 	 */
 	protected function setDetachedDirect(bool $value): void
 	{
@@ -320,6 +338,7 @@ class TH2Stream extends TComponent implements StreamInterface
 	/**
 	 * Returns the raw trailers-pending flag.
 	 * @return bool Whether a trailing header block is queued.
+	 * @since 1.0.0
 	 */
 	protected function getTrailersPendingDirect(): bool
 	{
@@ -329,6 +348,7 @@ class TH2Stream extends TComponent implements StreamInterface
 	/**
 	 * Sets the raw trailers-pending flag.
 	 * @param bool $value Whether a trailing header block is queued.
+	 * @since 1.0.0
 	 */
 	protected function setTrailersPendingDirect(bool $value): void
 	{
@@ -338,6 +358,7 @@ class TH2Stream extends TComponent implements StreamInterface
 	/**
 	 * Returns the raw trailing headers.
 	 * @return array<string, string> The queued trailing headers.
+	 * @since 1.0.0
 	 */
 	protected function getTrailersDirect(): array
 	{
@@ -347,6 +368,7 @@ class TH2Stream extends TComponent implements StreamInterface
 	/**
 	 * Sets the raw trailing headers.
 	 * @param array<string, string> $value The trailing headers.
+	 * @since 1.0.0
 	 */
 	protected function setTrailersDirect(array $value): void
 	{
@@ -417,17 +439,63 @@ class TH2Stream extends TComponent implements StreamInterface
 		$this->_writeHighWaterMark = $value;
 	}
 
+	/**
+	 * Returns the raw headers-submitted flag.
+	 * @return bool Whether this side's HEADERS were submitted.
+	 * @since 1.4.0
+	 */
+	protected function getHeadersSubmittedDirect(): bool
+	{
+		return $this->_headersSubmitted;
+	}
+
+	/**
+	 * Sets the raw headers-submitted flag.
+	 * @param bool $value Whether this side's HEADERS were submitted.
+	 * @since 1.4.0
+	 */
+	protected function setHeadersSubmittedDirect(bool $value): void
+	{
+		$this->_headersSubmitted = $value;
+	}
+
+	/**
+	 * Returns the raw incoming-released flag.
+	 * @return bool Whether the buffered incoming bytes were already reported as consumed.
+	 * @since 1.4.0
+	 */
+	protected function getIncomingReleasedDirect(): bool
+	{
+		return $this->_incomingReleased;
+	}
+
+	/**
+	 * Sets the raw incoming-released flag.
+	 * @param bool $value Whether the buffered incoming bytes were already reported as consumed.
+	 * @since 1.4.0
+	 */
+	protected function setIncomingReleasedDirect(bool $value): void
+	{
+		$this->_incomingReleased = $value;
+	}
+
 	// =========================================================================
 	// Properties
 	// =========================================================================
 
-	/** @return int The HTTP/2 stream identifier. */
+	/**
+	 * Returns the HTTP/2 stream identifier.
+	 * @return int The HTTP/2 stream identifier.
+	 */
 	public function getStreamId(): int
 	{
 		return $this->getStreamIdDirect();
 	}
 
-	/** @return array<string, string> The stream's headers, including pseudo-headers. */
+	/**
+	 * Returns the stream's headers.
+	 * @return array<string, string> The stream's headers, including pseudo-headers.
+	 */
 	public function getHeaders(): array
 	{
 		return $this->getHeadersDirect();
@@ -489,6 +557,28 @@ class TH2Stream extends TComponent implements StreamInterface
 		return strlen($this->getOutgoingDirect()) - $this->getOutgoingOffsetDirect();
 	}
 
+	/**
+	 * Returns the number of received bytes buffered and not yet read.
+	 * @return int The buffered byte count.
+	 * @since 1.4.0
+	 */
+	public function getIncomingLength(): int
+	{
+		return strlen($this->getIncomingDirect()) - $this->getIncomingOffsetDirect();
+	}
+
+	/**
+	 * Indicates whether this side's HEADERS were submitted: the request of a client stream, or the
+	 * response of a server stream ({@see TH2Session::respond()}).  nghttp2 sends this side's DATA and
+	 * END_STREAM only after them.
+	 * @return bool Whether this side's HEADERS were submitted.
+	 * @since 1.4.0
+	 */
+	public function hasHeadersSubmitted(): bool
+	{
+		return $this->getHeadersSubmittedDirect();
+	}
+
 	// =========================================================================
 	// Session Plumbing
 	// =========================================================================
@@ -496,6 +586,9 @@ class TH2Stream extends TComponent implements StreamInterface
 	/**
 	 * Appends received DATA bytes to the incoming buffer (called by {@see TH2Session}) and wakes a
 	 * fiber waiting in {@see readAsync()}.  A detached stream drops them: nothing can read them.
+	 * nghttp2 delivers none in practice: {@see close()} resets a stream whose peer still sends, and
+	 * nghttp2 keeps the DATA of a stream being reset to itself and returns it to the connection
+	 * window.
 	 * @param string $bytes The received bytes.
 	 */
 	public function pushIncoming(string $bytes): void
@@ -529,13 +622,20 @@ class TH2Stream extends TComponent implements StreamInterface
 		return $bytes;
 	}
 
-	/** @return bool Whether outgoing bytes are queued for sending. */
+	/**
+	 * Indicates whether outgoing bytes wait for DATA frames.
+	 * @return bool Whether outgoing bytes are queued for sending.
+	 */
 	public function hasOutgoing(): bool
 	{
 		return strlen($this->getOutgoingDirect()) > $this->getOutgoingOffsetDirect();
 	}
 
-	/** @return bool Whether received bytes are buffered, awaiting a read. */
+	/**
+	 * Indicates whether received bytes wait for a read.
+	 * @return bool Whether received bytes are buffered, awaiting a read.
+	 * @since 1.2.0
+	 */
 	private function hasIncoming(): bool
 	{
 		return strlen($this->getIncomingDirect()) > $this->getIncomingOffsetDirect();
@@ -548,6 +648,7 @@ class TH2Stream extends TComponent implements StreamInterface
 	 * @param string &$buffer The buffer, by reference.
 	 * @param int $offset The new consumed prefix length.
 	 * @return int The consumed prefix length after compaction.
+	 * @since 1.2.0
 	 */
 	private static function advance(string &$buffer, int $offset): int
 	{
@@ -562,7 +663,10 @@ class TH2Stream extends TComponent implements StreamInterface
 		return $offset;
 	}
 
-	/** @return bool Whether this side has finished writing. */
+	/**
+	 * Indicates whether this side has finished writing.
+	 * @return bool Whether this side has finished writing.
+	 */
 	public function isLocalClosed(): bool
 	{
 		return $this->getLocalClosedDirect();
@@ -582,14 +686,55 @@ class TH2Stream extends TComponent implements StreamInterface
 	/**
 	 * Marks both directions closed without touching the session: nghttp2 no longer has the stream
 	 * (the peer reset it, it completed, or the session closed).  Buffered incoming bytes stay
-	 * readable until drained; a {@see write()} throws.  Called by {@see TH2Session}.
+	 * readable until drained; a {@see write()} throws.  The bytes still buffered are reported to the
+	 * session now ({@see releaseIncoming()}), so an unread remainder cannot hold the connection
+	 * window.  Called by {@see TH2Session}.
 	 * @since 1.1.0
 	 */
 	public function markClosed(): void
 	{
 		$this->setRemoteClosedDirect(true);
 		$this->setLocalClosedDirect(true);
+		$this->releaseIncoming();
 		$this->wakeAllWaiters();
+	}
+
+	/**
+	 * Marks this side's HEADERS as submitted.  Called by {@see TH2Session::request()} for the new
+	 * client stream and by {@see TH2Session::respond()}.
+	 * @since 1.4.0
+	 */
+	public function markHeadersSubmitted(): void
+	{
+		$this->setHeadersSubmittedDirect(true);
+	}
+
+	/**
+	 * Reports the bytes still buffered to the session as consumed, once
+	 * ({@see TH2Session::consumeReceived()} with stream 0: the stream is ending, so only the
+	 * connection window gets them back).  Reads after it report nothing.
+	 * @since 1.4.0
+	 */
+	private function releaseIncoming(): void
+	{
+		if ($this->getIncomingReleasedDirect()) {
+			return;
+		}
+		$this->setIncomingReleasedDirect(true);
+		$this->getSessionDirect()->consumeReceived(0, $this->getIncomingLength());
+	}
+
+	/**
+	 * Reports bytes a read returned to the session ({@see TH2Session::consumeReceived()}), unless
+	 * the buffer was already released.
+	 * @param int $length The number of bytes read.
+	 * @since 1.4.0
+	 */
+	private function consumeIncoming(int $length): void
+	{
+		if ($length > 0 && !$this->getIncomingReleasedDirect()) {
+			$this->getSessionDirect()->consumeReceived($this->getStreamIdDirect(), $length);
+		}
 	}
 
 	/**
@@ -608,7 +753,11 @@ class TH2Stream extends TComponent implements StreamInterface
 		$this->getSessionDirect()->resumeStream($this->getStreamIdDirect());
 	}
 
-	/** @return bool Whether a trailing header block is queued to send after the body. */
+	/**
+	 * Indicates whether trailers wait for the body to drain.
+	 * @return bool Whether a trailing header block is queued to send after the body.
+	 * @since 1.0.0
+	 */
 	public function hasTrailersPending(): bool
 	{
 		return $this->getTrailersPendingDirect();
@@ -618,6 +767,7 @@ class TH2Stream extends TComponent implements StreamInterface
 	 * Returns the queued trailing headers and clears the pending flag.  Called by the session's
 	 * data provider once the body finishes, to submit the trailers exactly once.
 	 * @return array<string, string> The trailing headers.
+	 * @since 1.0.0
 	 */
 	public function consumeTrailers(): array
 	{
@@ -630,10 +780,12 @@ class TH2Stream extends TComponent implements StreamInterface
 	 * DATA, then the trailers are sent as a HEADERS frame with END_STREAM.  Trailers carry no
 	 * pseudo-headers (no `:status`).  Call after {@see write()}ing the body, instead of
 	 * {@see markLocalClosed()}.  The trailers are submitted by the data provider once the body has
-	 * drained, as nghttp2 requires.
+	 * drained, as nghttp2 requires.  A fiber waiting in {@see writeAsync()} is woken, as
+	 * {@see markLocalClosed()} wakes it.
 	 * @param array<string, string> $headers The trailing header name => value pairs.
 	 * @throws \RuntimeException When this side already finished (closed, detached, or local-closed):
 	 *   the body has ended, so nothing can carry the trailers.
+	 * @since 1.0.0
 	 */
 	public function sendTrailers(array $headers): void
 	{
@@ -643,6 +795,7 @@ class TH2Stream extends TComponent implements StreamInterface
 		$this->setTrailersDirect($headers);
 		$this->setTrailersPendingDirect(true);
 		$this->setLocalClosedDirect(true);
+		$this->wakeWaiter(self::WAIT_WRITE);
 		$this->getSessionDirect()->resumeStream($this->getStreamIdDirect());
 	}
 
@@ -783,6 +936,7 @@ class TH2Stream extends TComponent implements StreamInterface
 	 * Returns the high-water mark in effect: the set mark, else the peer's remaining flow-control
 	 * window for the stream (zero once the session is closed or nghttp2 no longer has the stream).
 	 * @return int The mark in bytes.
+	 * @since 1.3.0
 	 */
 	private function effectiveWriteHighWaterMark(): int
 	{
@@ -836,14 +990,19 @@ class TH2Stream extends TComponent implements StreamInterface
 
 	/**
 	 * Suspends the current fiber on the loop until {@see wakeWaiter()} is called for the kind or
-	 * the token is cancelled.  One fiber waits per kind.
+	 * the token is cancelled.  One fiber waits per kind.  A token cancelled before the wait throws
+	 * here: a cancelled token calls a new subscriber at once, and a suspension cannot be thrown into
+	 * before it suspends.  A wait that loops (a wake that did not satisfy it) passes through this
+	 * check on every round.
 	 * @param string $kind The wait kind: {@see WAIT_READ}, {@see WAIT_WRITE}, or {@see WAIT_RESPONSE}.
 	 * @param ?TCancellationToken $token A token whose cancellation ends the wait.
-	 * @throws TCancelledException When the token is cancelled while waiting.
+	 * @throws TCancelledException When the token is cancelled while waiting, or was cancelled before.
 	 * @throws \RuntimeException When another fiber already waits for the kind.
+	 * @since 1.3.0
 	 */
 	private function suspendOn(string $kind, ?TCancellationToken $token): void
 	{
+		$token?->throwIfCancelled();
 		if ($this->getWaiterDirect($kind) !== null) {
 			throw new \RuntimeException("Another fiber already waits on this HTTP/2 stream ($kind).");
 		}
@@ -871,6 +1030,7 @@ class TH2Stream extends TComponent implements StreamInterface
 	 * Resumes the fiber waiting for a kind, if any.  The loop resumes it on its next iteration, so
 	 * a wake from inside an nghttp2 callback switches no fiber there.
 	 * @param string $kind The wait kind: {@see WAIT_READ}, {@see WAIT_WRITE}, or {@see WAIT_RESPONSE}.
+	 * @since 1.3.0
 	 */
 	private function wakeWaiter(string $kind): void
 	{
@@ -881,7 +1041,10 @@ class TH2Stream extends TComponent implements StreamInterface
 		}
 	}
 
-	/** Resumes every waiting fiber: the stream is closing, and each wait re-checks its condition. */
+	/**
+	 * Resumes every waiting fiber: the stream is closing, and each wait re-checks its condition.
+	 * @since 1.3.0
+	 */
 	private function wakeAllWaiters(): void
 	{
 		foreach ([self::WAIT_READ, self::WAIT_WRITE, self::WAIT_RESPONSE] as $kind) {
@@ -915,7 +1078,8 @@ class TH2Stream extends TComponent implements StreamInterface
 
 	/**
 	 * Returns up to $length buffered incoming bytes (non-blocking).  An open stream with nothing
-	 * buffered returns '' at once.
+	 * buffered returns '' at once.  Under {@see TH2Options::setConsumeOnRead() ConsumeOnRead} the
+	 * bytes returned reopen the peer's flow-control window.
 	 * @param int $length The maximum number of bytes to return.
 	 * @throws \RuntimeException When the stream is detached/closed, or $length is negative.
 	 * @return string The bytes read, or '' when none are buffered.
@@ -936,6 +1100,7 @@ class TH2Stream extends TComponent implements StreamInterface
 		$bytes = substr($incoming, $offset, $length);
 		$this->setIncomingOffsetDirect(self::advance($incoming, $offset + strlen($bytes)));
 		$this->setReadPositionDirect($this->getReadPositionDirect() + strlen($bytes));
+		$this->consumeIncoming(strlen($bytes));
 		return $bytes;
 	}
 
@@ -952,15 +1117,19 @@ class TH2Stream extends TComponent implements StreamInterface
 		$bytes = substr($this->getIncomingDirect(), $this->getIncomingOffsetDirect());
 		$this->setIncomingDirect('');
 		$this->setReadPositionDirect($this->getReadPositionDirect() + strlen($bytes));
+		$this->consumeIncoming(strlen($bytes));
 		return $bytes;
 	}
 
 	/**
 	 * Closes the stream for both directions, clears its buffers, and ends it on the wire.  A peer
 	 * that has not finished sending is cancelled (RST_STREAM CANCEL), so it cannot mistake the
-	 * discarded body for a complete one; a peer that has finished sees this side end (END_STREAM).
-	 * The stream becomes unusable: a later {@see read()}, {@see getContents()}, or {@see write()}
-	 * throws (PSR-7).  Idempotent, and a no-op on the wire once the session is closed.
+	 * discarded body for a complete one.  A stream whose HEADERS this side never submitted (a
+	 * request the server did not {@see TH2Session::respond() answer}) is cancelled as well: with no
+	 * response there is nothing to end, and the peer would wait.  Otherwise a peer that has finished
+	 * sees this side end (END_STREAM).  The stream becomes unusable: a later {@see read()},
+	 * {@see getContents()}, or {@see write()} throws (PSR-7).  Idempotent, and a no-op on the wire
+	 * once the session is closed or nghttp2 has closed the stream.
 	 */
 	public function close(): void
 	{
@@ -972,13 +1141,14 @@ class TH2Stream extends TComponent implements StreamInterface
 		$this->setLocalClosedDirect(true);
 		$this->setRemoteClosedDirect(true);
 		$this->setDetachedDirect(true);
+		$this->releaseIncoming();
 		$this->setIncomingDirect('');
 		$this->setOutgoingDirect('');
 		$this->setTrailersPendingDirect(false);
 		$this->setTrailersDirect([]);
 		$this->wakeAllWaiters();
 		$session = $this->getSessionDirect();
-		if ($remoteOpen) {
+		if ($remoteOpen || ($localOpen && !$this->getHeadersSubmittedDirect())) {
 			try {
 				$session->resetStream($this->getStreamIdDirect());
 			} catch (THttp2Exception $e) {
@@ -1000,38 +1170,56 @@ class TH2Stream extends TComponent implements StreamInterface
 		return null;
 	}
 
-	/** @return bool Whether the peer has half-closed and the buffer is drained. */
+	/**
+	 * Indicates end of stream: the peer has half-closed and every buffered byte was read.
+	 * @return bool Whether the peer has half-closed and the buffer is drained.
+	 */
 	public function eof(): bool
 	{
 		return $this->getRemoteClosedDirect() && !$this->hasIncoming();
 	}
 
-	/** @return ?int Always null; an HTTP/2 stream length is unknown. */
+	/**
+	 * Returns the stream size, which HTTP/2 does not know.
+	 * @return ?int Always null; an HTTP/2 stream length is unknown.
+	 */
 	public function getSize(): ?int
 	{
 		return null;
 	}
 
-	/** @return int The total number of bytes read so far. */
+	/**
+	 * Returns the read position.
+	 * @return int The total number of bytes read so far.
+	 */
 	public function tell(): int
 	{
 		return $this->getReadPositionDirect();
 	}
 
-	/** @return bool Whether incoming bytes can be read (true until detached and drained). */
+	/**
+	 * Indicates whether a read can still return bytes.
+	 * @return bool Whether incoming bytes can be read (true until detached and drained).
+	 */
 	public function isReadable(): bool
 	{
 		return !$this->getDetachedDirect()
 			&& (!$this->getRemoteClosedDirect() || $this->hasIncoming());
 	}
 
-	/** @return bool Whether bytes can be written (true until this side closes or detaches). */
+	/**
+	 * Indicates whether a write is accepted.
+	 * @return bool Whether bytes can be written (true until this side closes or detaches).
+	 */
 	public function isWritable(): bool
 	{
 		return !$this->getDetachedDirect() && !$this->getLocalClosedDirect();
 	}
 
-	/** @return bool Always false; an HTTP/2 stream is not seekable. */
+	/**
+	 * Indicates whether the stream can seek, which an HTTP/2 stream cannot.
+	 * @return bool Always false; an HTTP/2 stream is not seekable.
+	 */
 	public function isSeekable(): bool
 	{
 		return false;

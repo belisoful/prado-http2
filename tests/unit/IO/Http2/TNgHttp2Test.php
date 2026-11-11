@@ -37,9 +37,35 @@ class TNgHttp2Test extends PHPUnit\Framework\TestCase
 	{
 		TNgHttp2::setLibraryPath('/nonexistent/libnghttp2.dylib');
 		try {
-			$this->expectException(THttp2Exception::class);
 			TNgHttp2::ffi();
+			self::fail('A missing library did not throw.');
+		} catch (THttp2Exception $e) {
+			self::assertSame('http2_library_missing', $e->getErrorCode());
+			self::assertStringContainsString('/nonexistent/libnghttp2.dylib', $e->getMessage(), 'The message names what was tried.');
 		} finally {
+			TNgHttp2::setLibraryPath(null);
+		}
+	}
+
+	public function testEnvironmentLibraryIsACandidateAheadOfThePlatformDefaults()
+	{
+		if (getenv('PRADO_NGHTTP2_LIB') !== false) {
+			$this->markTestSkipped('PRADO_NGHTTP2_LIB is set for this run; the test would replace it.');
+		}
+		putenv('PRADO_NGHTTP2_LIB=/nonexistent/from-env/libnghttp2.so');
+		try {
+			TNgHttp2::setLibraryPath(null);                    // resolve again, now with the environment candidate
+			self::assertTrue(TNgHttp2::isAvailable(), 'A bad environment path is skipped and the platform defaults still load.');
+			self::assertMatchesRegularExpression('/^\d+\.\d+/', TNgHttp2::version());
+			TNgHttp2::setLibraryPath('/nonexistent/explicit/libnghttp2.so');
+			try {
+				TNgHttp2::ffi();
+				self::fail('An explicit path is the only candidate.');
+			} catch (THttp2Exception $e) {
+				self::assertStringNotContainsString('from-env', $e->getMessage(), 'An explicit path overrides the environment.');
+			}
+		} finally {
+			putenv('PRADO_NGHTTP2_LIB');
 			TNgHttp2::setLibraryPath(null);
 		}
 	}

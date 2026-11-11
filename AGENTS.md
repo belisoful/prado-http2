@@ -5,7 +5,8 @@
 ## Build, Lint, and Test Commands
 
 - **Unit tests**: `composer unittest` (`vendor/bin/phpunit --testsuite unit`) — two in-process nghttp2 sessions, no sockets/TLS.
-- **Functional tests**: `composer functest` (`vendor/bin/phpunit --testsuite functional`) — `curl --http2-prior-knowledge` interop over a real socket.
+- **Functional tests**: `composer functest` (`vendor/bin/phpunit --testsuite functional`) — `curl` interop over a real socket (h2c, and h2 over TLS through `pump()`).
+- **Coverage** (needs Xdebug): `composer coverage` (lines), `composer coverage-path` (lines, branches, paths), `composer coverage-html` (report in `build/coverage`).
 - **Test filter**: `vendor/bin/phpunit --testsuite unit --filter <function|class>`.
 - **PHPStan**: `vendor/bin/phpstan analyse --memory-limit=512M` (level 4, PHP 8.2 to 8.5, over `src/` and `tests/`).
 - **PHP CS Fixer**: `vendor/bin/php-cs-fixer fix --dry-run` (check) / `vendor/bin/php-cs-fixer fix` (apply); covers `src/` and `tests/`.
@@ -37,7 +38,7 @@
 ### Documentation Standards
 - Every public method has a PHPDoc block with `@param`/`@return`/`@throws` as applicable, plus at least one descriptive sentence.
 - Classes have a clear top docblock (what/why/how, an example where useful) with `@author` and `@since`.
-- `@since` names the release the change ships in: the next version (`1.3.0` once it is tagged, then the one after), never the last tag.
+- `@since` names the release the change ships in: the version after the last tag (`git tag`), which CHANGELOG.md's `[Unreleased]` section becomes; never the last tag itself. After v1.3.0 that is `1.4.0`.
 - Docblocks are technical, present tense, American English. Banned: antithesis ("not X, it Ys"), em-dash dramatic asides, editorializing/filler, rule-of-three lists. One fact per sentence; prefer subject-verb-object and `condition → result`.
 
 ### Error Handling
@@ -57,8 +58,9 @@
 - **Fibers.** `TH2Stream::readAsync()`/`writeAsync()`/`awaitResponse()` (and the bare `waitReadable()`/`waitWritable()`) suspend the current fiber on `TAsync::getLoop()`, one waiter per kind; `TH2Session::pump(TAsyncStream $transport, $token)` drives a session on the loop, writing what the non-blocking transport accepts and holding the rest so it keeps reading while its output waits. See CLAUDE.md "Re-entry and fibers", "Fiber-aware stream waits", and "Pump".
 - **Callbacks** are PHP closures built **once** and shared by every session, kept alive process-wide in the static `$_sharedRefs` (a closure handed to FFI lives for the FFI instance's life, so per-session closures would leak); each session captures the shared provider/closures (`$_dataProvider`, `$_refs`). Routing to the owning session is via nghttp2's `user_data` through the FFI instance the closures were built with, so two sessions never cross-talk. The routing registry holds `WeakReference`s, so an unreferenced session is collected and its `__destruct` closes it.
 - **Data providers** pull outgoing DATA from per-stream queues; deferred until the stream resumes. `TH2Stream::markLocalClosed()` finishes a finite body (flush then END_STREAM) and resumes the stream so a deferred provider re-arms; `sendTrailers()` ends with a trailing header block; `close()` tears the stream down.
-- **Closed state.** `TH2Session::close()` frees the nghttp2 session and marks the remaining streams closed (`TH2Stream::markClosed()`); every later nghttp2 call throws `http2_session_closed` (`resumeStream()`/`wantsIo()` degrade quietly). A peer reset or completion marks the stream closed the same way before `onClose`.
-- **Headers.** Names are lowercased on submit; a repeated received field joins (`cookie` with `; `, others with `, `). A second HEADERS on a stream raises `onTrailers` on both server and client.
+- **Closed state.** `TH2Session::close()` frees the nghttp2 session, marks the remaining streams closed (`TH2Stream::markClosed()`), and raises `onClose` for each of them (the destructor raises none); every later nghttp2 call throws `http2_session_closed` (`resumeStream()`/`wantsIo()` degrade quietly). A peer reset or completion marks the stream closed the same way before `onClose`. `TH2Stream::close()` resets a stream whose peer is still sending or whose HEADERS this side never submitted (an unanswered request).
+- **Headers.** Names are lowercased on submit; a name that is not a token and a value with CR, LF, or NUL throw `http2_header_invalid`. A repeated received field joins (`cookie` with `; `, others with `, `). A second HEADERS on a stream raises `onTrailers` on both server and client. A received block over the header list limit (`TH2Options::MaxHeaderListSize`, 64 KiB by default) is dropped and its stream reset: nghttp2 does not bound the decoded size, so never accumulate received headers without that count.
+- **Receive flow control.** Automatic by default (a stream buffers whatever arrives until read). `TH2Options::ConsumeOnRead` makes reads reopen the peer's window (`TH2Session::consumeReceived()`), and the unread bytes of a closing or application-closed stream return to the connection window. See CLAUDE.md "Receive flow control".
 - **The cdef mirrors `nghttp2.h`**: `nghttp2_ssize` is `ptrdiff_t`, struct fields keep the header's order.
 - **The cdef** in `TNgHttp2` is the only place C declarations live. Extend it there when binding more of the nghttp2 API.
 - **FFI gotchas**: call `cast()`/`new()` on the bound instance (`$ffi->cast(...)`); `FFI::addr`/`string`/`memcpy` are static; a `const char*` arrives as a PHP string both as a return value and as a callback parameter (e.g. `error_callback2`'s `msg`), while a `uint8_t*` stays CData and needs `FFI::string($ptr, $len)`.
@@ -73,13 +75,13 @@
 
 ## Testing Guidelines
 - The testing platform is PHPUnit. All new code must include unit tests asserting typical and edge cases, including error/exception handling.
-- Unit tests drive in-process sessions (no network). The functional suite is the curl interop test and self-skips without `libnghttp2`/curl/`proc_open`.
+- Unit tests drive in-process sessions (no network). The functional suite is the curl interop tests (h2c and TLS) and the TLS/ALPN handshakes; it self-skips without `libnghttp2`/curl/`proc_open`/`ext-openssl`, and CI fails a step when any test is skipped.
 - Tests are isolated (no shared state). When testing one class or cluster, run only its tests.
 
 ## Development Environment
 - PHP 8.2+; extensions: ffi (required), openssl (h2 over TLS), plus the framework's ctype, dom, intl, json, pcre, spl.
-- System library: `libnghttp2` 1.60.0 or newer (bound via FFI). CI runs on `ubuntu-26.04` (libnghttp2 1.68.0; 24.04 has 1.59.0) and a workflow step fails when the library does not load, since the tests otherwise skip.
-- `pradosoft/prado ^4.4` is a dev dependency. 4.4 is unreleased, so composer.json resolves it from the sibling `../prado` path repository and CI checks out `pradosoft/prado@master` there (weekly scheduled run included). The framework's own dependencies (`revolt/event-loop`, `psr/cache`, `psr/simple-cache`) install through it; after the framework adds one, run `composer update` (the lock file is not committed).
+- System library: `libnghttp2` 1.60.0 or newer (bound via FFI). CI runs on `ubuntu-26.04` (libnghttp2 1.68.0; 24.04 has 1.59.0) and a workflow step fails when the library does not load, since the tests otherwise skip. An `ubuntu-24.04` job checks the `http2_library_too_old` path. CI installs the php-cs-fixer and PHPStan versions composer.json pins.
+- `pradosoft/prado ^4.4@dev` is a requirement. 4.4 is unreleased, so composer.json resolves it from the sibling `../prado` path repository and CI checks out `pradosoft/prado@master` there (weekly scheduled run included). The framework's own dependencies (`revolt/event-loop`, `psr/cache`, `psr/simple-cache`) install through it; after the framework adds one, run `composer update` (the lock file is not committed).
 - Composer for dependency management; presume dependencies are installed.
 
 # PRADO Framework Agent Safeguards — ANTI-PATTERNS

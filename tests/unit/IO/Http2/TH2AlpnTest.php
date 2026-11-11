@@ -58,8 +58,11 @@ class TH2AlpnTest extends PHPUnit\Framework\TestCase
 	{
 		$stream = fopen('php://memory', 'r+');
 		try {
-			$this->expectException(THttp2Exception::class);
 			TH2Alpn::requireH2($stream);
+			self::fail('requireH2() accepted a stream without ALPN.');
+		} catch (THttp2Exception $e) {
+			self::assertSame('http2_alpn_not_negotiated', $e->getErrorCode());
+			self::assertStringContainsString('(none)', $e->getMessage());
 		} finally {
 			fclose($stream);
 		}

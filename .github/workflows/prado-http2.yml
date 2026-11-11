@@ -7,6 +7,8 @@ on:
     # commit here triggered. Once a week catches that.
     - cron: '23 6 * * 1'
   workflow_dispatch:
+permissions:
+  contents: read
 jobs:
   composerext:
     name: Tests (PHP ${{ matrix.php-versions }})
@@ -45,7 +47,8 @@ jobs:
         with:
           php-version: ${{ matrix.php-versions }}
           extensions: ctype, dom, ffi, intl, json, mbstring, openssl, pcre, spl, zlib
-          tools: php-cs-fixer, phpstan, cs2pr
+          # The versions composer.json pins, so a new upstream release cannot change a run.
+          tools: php-cs-fixer:3.95.27, phpstan:2.3.0, cs2pr
 
       - name: Validate composer.json and composer.lock
         run: composer validate --strict
@@ -73,10 +76,64 @@ jobs:
           curl --version | grep -q HTTP2
 
       - name: Validate code using phpstan
-        run: phpstan analyse --error-format=checkstyle | cs2pr
+        run: phpstan analyse --memory-limit=512M --error-format=checkstyle | cs2pr
 
+      # A test that cannot run here skips itself; on this runner every prerequisite is installed, so
+      # a skip means a test stopped running. The step fails on it.
       - name: Run Unit Tests
-        run: composer unittest
+        run: |
+          set -o pipefail
+          composer unittest | tee unit.log
+          if grep -q 'Skipped:' unit.log; then echo "::error::Unit tests were skipped."; exit 1; fi
 
-      - name: Run Functional Tests (HTTP/2 interop via curl)
-        run: composer functest
+      - name: Run Functional Tests (HTTP/2 interop via curl, TLS with ALPN)
+        run: |
+          set -o pipefail
+          composer functest | tee functional.log
+          if grep -q 'Skipped:' functional.log; then echo "::error::Functional tests were skipped."; exit 1; fi
+
+  # Ubuntu 24.04 ships libnghttp2 1.59.0, older than TNgHttp2::MIN_VERSION. Version 1.2.0 crashed
+  # PHP 8.4 and 8.5 there (a use-after-free in the version probe); the library must be reported as
+  # too old, repeatedly, without a crash.
+  oldlibrary:
+    name: Too-old libnghttp2 (PHP ${{ matrix.php-versions }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        php-versions: ['8.2', '8.4', '8.5']
+
+    defaults:
+      run:
+        working-directory: prado-http2
+
+    steps:
+      - name: Checkout extension
+        uses: actions/checkout@v7
+        with:
+          path: prado-http2
+
+      - name: Checkout PRADO framework (4.4 dev)
+        uses: actions/checkout@v7
+        with:
+          repository: pradosoft/prado
+          ref: master
+          path: prado
+
+      - name: Install libnghttp2
+        timeout-minutes: 10
+        run: sudo apt-get update && sudo apt-get install -y libnghttp2-14
+
+      - name: Setup PHP, with composer and extensions
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php-versions }}
+          extensions: ctype, dom, ffi, intl, json, mbstring, openssl, pcre, spl, zlib
+
+      - name: Install Composer dependencies
+        run: composer install --no-progress --prefer-dist --optimize-autoloader
+
+      - name: The library is reported as too old
+        run: php tests/test_tools/assert_library_too_old.php

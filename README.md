@@ -16,7 +16,7 @@ It is the foundation for HTTP/2 servers and clients, and for [RFC 8441](https://
 | `ext-ffi` | required | Binds `libnghttp2` at runtime |
 | System `libnghttp2` 1.60.0 or newer | suggested | The HTTP/2 framing engine, loaded at runtime (`brew install libnghttp2`, `apt-get install libnghttp2-dev`); 1.60.0 introduced the `nghttp2_ssize` API this binding declares. Ubuntu 24.04 ships 1.59.0, Ubuntu 26.04 ships 1.68.0 |
 | `ext-openssl` | suggested | HTTP/2 over TLS with ALPN `h2`; cleartext `h2c` needs nothing extra |
-| PRADO Framework `^4.4` (master) | dev | `TComponent`, `TException`/`TIOException`, the PHPStan extensions |
+| PRADO Framework `^4.4` (master) | required | `TComponent`, `TException`/`TIOException`, the event loop and fibers (`Prado\IO\Async`), PSR-7 `StreamInterface`; the PHPStan extensions in development |
 
 > **FFI note.** `ffi.enable` must permit FFI (CLI always allows it; for other SAPIs use `preload` or `true`). HTTP/2 here is intended for a long-running PHP process (a socket server or client), not a per-request web SAPI.
 
@@ -35,7 +35,7 @@ The library is resolved in this order: an explicit path set with `TNgHttp2::setL
 | `Prado\IO\Http2\TNgHttp2` | The `libnghttp2` FFI binding: library resolution, the C-declaration surface, and `version()`/`isAvailable()`/`strerror()` helpers and protocol constants |
 | `Prado\IO\Http2\TH2Session` | One HTTP/2 connection (server or client): drives nghttp2, manages streams, moves bytes with `receive()`/`send()`, exposes connection control (`resetStream`/`goaway`/`ping`/settings/flow control), and raises stream and diagnostic events, and `pump()`s a `TAsyncStream` transport on the PRADO 4.4 event loop |
 | `Prado\IO\Http2\TH2Stream` | One HTTP/2 stream as a duplex PSR-7 `StreamInterface`: carries headers, buffers incoming DATA, queues outgoing DATA, and can `cancel()`; the fiber-aware `readAsync()`, `writeAsync()`, and `awaitResponse()` suspend on the event loop |
-| `Prado\IO\Http2\TH2Options` | Optional session tuning (`PeerMaxConcurrentStreams`, `NoAutoWindowUpdate`), applied at creation |
+| `Prado\IO\Http2\TH2Options` | Optional session tuning (`PeerMaxConcurrentStreams`, `NoAutoWindowUpdate`, `ConsumeOnRead`, `MaxHeaderListSize`), applied at creation |
 | `Prado\IO\Http2\TH2Alpn` | TLS/ALPN helper: advertises `h2` in an `ssl` stream context and reads the negotiated protocol back (needs `ext-openssl`) |
 | `Prado\IO\Http2\THttp2Exception` | An HTTP/2 failure (library missing, session error); extends `TIOException` |
 
@@ -125,9 +125,9 @@ $session->receive($transport->read(65536));
 
 `TH2Stream` is a full PSR-7 `StreamInterface` (`write()` queues outgoing DATA and resumes the stream; `read()`/`getContents()` return buffered incoming DATA; it is **not** seekable). Per PSR-7 it throws when written to after it is local-closed/closed, or read after it is closed/detached. This supports request/response bodies and long-lived tunnels alike. An RFC 8441 Extended CONNECT (`:method` `CONNECT`, `:protocol` `websocket`) opens a bidirectional stream that carries arbitrary bytes both ways — the basis for WebSocket-over-HTTP/2.
 
-A finite body is finished two ways: `markLocalClosed()` flushes the queued bytes and ends the stream (END_STREAM), and `sendTrailers([...])` flushes the body and then ends the stream with a trailing header block (HTTP/2 trailers, e.g. `grpc-status`). `close()` discards the buffers, detaches the stream, and ends it on the wire: a peer still sending is cancelled (RST_STREAM CANCEL), a peer that has finished sees END_STREAM. Once nghttp2 closes a stream (peer reset, completion, or session close) both directions are marked closed: buffered bytes stay readable and a write throws.
+A finite body is finished two ways: `markLocalClosed()` flushes the queued bytes and ends the stream (END_STREAM), and `sendTrailers([...])` flushes the body and then ends the stream with a trailing header block (HTTP/2 trailers, e.g. `grpc-status`). `close()` discards the buffers, detaches the stream, and ends it on the wire: a peer still sending is cancelled (RST_STREAM CANCEL), and so is a request the server never answered with `respond()`; otherwise a peer that has finished sees END_STREAM. Once nghttp2 closes a stream (peer reset, completion, or session close) both directions are marked closed: buffered bytes stay readable and a write throws.
 
-Trailers flow both ways: `onTrailers` fires on the server for request trailers and on the client for response trailers. Header names are lowercased on submit (RFC 9113 §8.2.1). A received field that repeats keeps every value: `cookie` crumbs rejoin with `; ` and any other name combines with `, `.
+Trailers flow both ways: `onTrailers` fires on the server for request trailers and on the client for response trailers. Header names are lowercased on submit (RFC 9113 §8.2.1). A name that is not a token (one leading colon marks a pseudo-header) and a value with a CR, LF, or NUL character throw `http2_header_invalid`: nghttp2 would send them, and a peer drops such a field without notice or rejects the message. A received field that repeats keeps every value: `cookie` crumbs rejoin with `; ` and any other name combines with `, `.
 
 ### Connection control and tuning
 
@@ -139,14 +139,43 @@ Trailers flow both ways: `onTrailers` fires on the server for request trailers a
 - `getRemoteSetting($id)` / `getLocalSetting($id)` — read negotiated SETTINGS (e.g. a client checking `getRemoteSetting(SETTINGS_ENABLE_CONNECT_PROTOCOL)` before an Extended CONNECT).
 - `wantsIo()` — whether the session still has I/O pending, so an event loop knows when to stop.
 - `isRequestAllowed()` — client-side: whether a new `request()` is permitted (not GOAWAY-ed, under the limit).
-- `submitWindowUpdate()` / `consume()` — manual flow control, paired with `TH2Options::setNoAutoWindowUpdate()`.
-- `close()` — frees the nghttp2 session and marks its open streams closed; any later nghttp2 call on the session throws `http2_session_closed`. Sessions are held weakly, so an unreferenced session is collected and freed on its own.
+- `submitWindowUpdate()` / `consume()` — manual flow control, paired with `TH2Options::setNoAutoWindowUpdate()` (see [Limits and flow control](#limits-and-flow-control)).
+- `getMaxHeaderListSize()` — the largest header block the session accepts.
+- `close()` — frees the nghttp2 session, marks its open streams closed, and raises `onClose` for each of them; any later nghttp2 call on the session throws `http2_session_closed`. Sessions are held weakly, so an unreferenced session is collected and freed on its own (with no `onClose`).
 
 A client session declines server push: `submitSettings()` adds `TNgHttp2::SETTINGS_ENABLE_PUSH => 0` unless the caller gives that id. A pushed stream has no `TH2Stream`, so its frames are discarded even when push is enabled.
 
 Event handlers run inside nghttp2 callbacks, where PHP cannot throw. A Throwable raised by a handler is held until nghttp2 finishes the `receive()` or `send()` call that triggered it, then rethrown from that call; every frame in that call was still processed and the session stays usable (bytes a throwing `send()` produced come out of the next `send()`). A failure inside the data provider resets only its stream. Header names are lowercased and pseudo-headers ordered first on submit; a name given twice in different letter case throws `http2_header_duplicate`. Calling `close()` on the session from inside a handler is safe: the PHP side closes at once and nghttp2 is freed when the call returns.
 
-Tuning is passed at creation: `new TH2Session(true, (new TH2Options())->setPeerMaxConcurrentStreams(100))`. Diagnostic events `onFrameSent`/`onFrameNotSent`/`onInvalidFrame`/`onSessionError` surface frame activity and protocol errors.
+Tuning is passed at creation. The `TH2Options` setters return nothing, so build the object first:
+
+```php
+$options = new TH2Options();
+$options->setPeerMaxConcurrentStreams(100);
+$session = new TH2Session(true, $options);
+```
+
+Diagnostic events `onFrameSent`/`onFrameNotSent`/`onInvalidFrame`/`onSessionError` surface frame activity and protocol errors.
+
+`onClose` is raised once per stream: when nghttp2 closes it (both sides finished, or a reset), and from `TH2Session::close()` for each stream still open, which covers a connection that drops (the pump closes the session when the transport ends). In the second case the session is already closed when the handler runs.
+
+### Limits and flow control
+
+A session that faces untrusted peers needs three bounds. The first is on by default; the other two are the application's choice.
+
+- **Header size.** nghttp2 does not bound the decoded size of a header block, and `SETTINGS_MAX_HEADER_LIST_SIZE` is advisory. HPACK lets 147 KB on the wire decode to a 574 MB header list. The session enforces a limit itself: a block whose header list (name length + value length + 32 per field, RFC 9113 §6.5.2) passes `getMaxHeaderListSize()` is dropped, its stream is reset, and `onInvalidFrame` is raised. The limit is 64 KiB (`TH2Session::DEFAULT_MAX_HEADER_LIST_SIZE`) unless `TH2Options::setMaxHeaderListSize($bytes)` sets another; `0` turns it off. `submitSettings()` advertises it.
+- **Concurrent streams.** nghttp2 accepts any number of streams until the session says otherwise. A server submits `TNgHttp2::SETTINGS_MAX_CONCURRENT_STREAMS` (100 is a common value) with its settings.
+- **Body buffering.** Under automatic flow control (the default) nghttp2 reopens the peer's window as DATA arrives, so a stream buffers whatever the peer sends until the application reads it: a body nobody reads, or one read slower than it arrives, grows without limit. `TH2Options::setConsumeOnRead(true)` reopens the window as the application reads instead (`read()`, `getContents()`, `readAsync()`), so a stream buffers at most the window (64 KiB by default) and the peer waits. Bytes left unread when a stream closes, or when the application closes it, go back to the connection window, so one abandoned stream cannot stall the others. While a stream holds unread bytes it also holds that much of the connection window; raise the connection window with `submitWindowUpdate(0, $increment)` when many streams upload at once.
+
+```php
+$options = new TH2Options();
+$options->setConsumeOnRead(true);                // the peer's window follows the application's reads
+$options->setMaxHeaderListSize(16384);           // optional: tighter than the 64 KiB default
+$session = new TH2Session(true, $options);
+$session->submitSettings([TNgHttp2::SETTINGS_MAX_CONCURRENT_STREAMS => 100]);
+```
+
+`TH2Options::setNoAutoWindowUpdate(true)` alone leaves the accounting to the application: it calls `consume($streamId, $bytes)` for what it has processed, including the bytes still buffered on a stream it closes (`TH2Stream::getIncomingLength()` is that count). Do not call `consume()` under `ConsumeOnRead`.
 
 ### Event loops and fibers
 
@@ -181,7 +210,7 @@ $session->attachEventHandler('onRequest', function ($session, $stream) use ($sto
 
 `TH2Stream::awaitResponse($token = null)` suspends a client fiber until the final response headers arrive (a `:status` other than 1xx; `hasFinalResponse()` is the check) and returns the headers; a 1xx keeps the wait going, and a stream that ends first (reset, session close) throws. The body then follows through `readAsync()`.
 
-`TH2Session::pump($transport, $token = null)` drives a session over a `TAsyncStream` transport on the loop, so a server or client needs no I/O loop of its own. Each round drains `send()`, writes what the transport accepts at once (a `TAsyncStream` sets its stream non-blocking), and holds the rest for the next round. The pump returns once nothing is held and the session wants no more I/O (a GOAWAY exchange has completed). Otherwise it waits until the transport is readable, the transport accepts more of the held output, or a submit queued output, and feeds what it reads to `receive()`. The pump keeps reading while its own output waits, so two pumped peers that both send more than the socket buffer holds make progress. Every submit wakes a waiting pump (`respond()`, a stream write from another fiber, `goaway()`, ...), so a worker fiber's response reaches the wire without the caller flushing. End of stream on the transport, or a read or write that fails (a peer that resets the connection), closes the session; the caller closes the transport. A cancelled token throws `TCancelledException` out of the pump and leaves the session open, with the held output kept for the next `send()`; a Throwable an event handler raised leaves the pump through `receive()` the same way. One fiber pumps a session at a time (`http2_pump_in_progress`), and the transport's inner stream must own an open PHP stream resource (`http2_pump_transport`).
+`TH2Session::pump($transport, $token = null)` drives a session over a `TAsyncStream` transport on the loop, so a server or client needs no I/O loop of its own. Each round drains `send()`, writes what the transport accepts at once (a `TAsyncStream` sets its stream non-blocking), and holds the rest for the next round. The pump returns once nothing is held and the session wants no more I/O (a GOAWAY exchange has completed). Otherwise it waits until the transport is readable, the transport accepts more of the held output, or a submit queued output, and feeds what it reads to `receive()`. The pump keeps reading while its own output waits, so two pumped peers that both send more than the socket buffer holds make progress. Every submit wakes a waiting pump (`respond()`, a stream write from another fiber, `goaway()`, ...), so a worker fiber's response reaches the wire without the caller flushing. End of stream on the transport, or a read or write that fails (a peer that resets the connection), closes the session (raising `onClose` for the streams still open); the caller closes the transport. An nghttp2 failure in `receive()` (a peer that does not speak HTTP/2) leaves the pump as a `THttp2Exception` with the session still open; the caller closes it. A cancelled token throws `TCancelledException` out of the pump and leaves the session open, with the held output kept for the next `send()`; a Throwable an event handler raised leaves the pump through `receive()` the same way. One fiber pumps a session at a time (`http2_pump_in_progress`), and the transport's inner stream must own an open PHP stream resource (`http2_pump_transport`).
 
 ```php
 use Prado\IO\Async\TAsync;
@@ -276,12 +305,14 @@ A client mirrors this with `stream_socket_client('tls://...')` and `TH2Alpn::neg
 ```sh
 composer install
 composer unittest                                # unit tests (dual in-process sessions)
-composer functest                                # curl --http2-prior-knowledge interop + TLS ALPN
+composer functest                                # curl interop (h2c and h2 over TLS) + TLS ALPN
+composer coverage                                # line coverage of src/ (needs Xdebug)
+composer coverage-path                           # line, branch, and path coverage
 vendor/bin/php-cs-fixer fix --dry-run            # code style (src/ and tests/)
 vendor/bin/phpstan analyse --memory-limit=512M   # static analysis, level 4, PHP 8.2 to 8.5
 ```
 
-Unit tests drive a server and a client `TH2Session` against each other in-process (no sockets, no TLS), so they run anywhere `libnghttp2` is installed and skip cleanly where it is not. The functional tests serve a request to the system `curl` over a real socket and complete a TLS handshake that negotiates `h2`. CI runs the whole check on PHP 8.2 through 8.5 against the PRADO `master` branch, on every push and once a week, on Ubuntu 26.04 (its libnghttp2 is new enough); a step fails the run when the library or an HTTP/2 `curl` is missing, so the skips cannot pass silently.
+Unit tests drive a server and a client `TH2Session` against each other in-process (no sockets, no TLS), so they run anywhere `libnghttp2` is installed and skip cleanly where it is not. The functional tests serve requests to the system `curl` over a real socket, in cleartext and over TLS, and complete TLS handshakes that negotiate `h2` and `http/1.1`. CI runs the whole check on PHP 8.2 through 8.5 against the PRADO `master` branch, on every push and once a week, on Ubuntu 26.04 (its libnghttp2 is new enough). A step fails the run when the library or an HTTP/2 `curl` is missing, and the test steps fail when any test is skipped, so a skip cannot pass silently. A second job runs on Ubuntu 24.04, whose libnghttp2 1.59.0 is too old, and checks that the binding reports it as `http2_library_too_old`.
 
 ## License
 

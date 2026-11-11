@@ -27,7 +27,7 @@ namespace Prado\IO\Http2;
  * test that pumps bytes between two in-process sessions.
  *
  * @author Brad Anderson <belisoful@icloud.com>
- * @since 1.0.0
+ * @since 0.9.0
  * @see https://nghttp2.org/documentation/
  * @see https://www.rfc-editor.org/rfc/rfc9113.html
  */
@@ -133,10 +133,16 @@ final class TNgHttp2
 	 */
 	public const MIN_VERSION = '1.60.0';
 
-	/** @var int {@see MIN_VERSION} as nghttp2's `version_num` (`major << 16 | minor << 8 | patch`). */
+	/**
+	 * @var int {@see MIN_VERSION} as nghttp2's `version_num` (`major << 16 | minor << 8 | patch`).
+	 * @since 1.2.0
+	 */
 	private const MIN_VERSION_NUM = 0x013c00;
 
-	/** @var string The declarations of the version probe, valid for every libnghttp2 release. */
+	/**
+	 * @var string The declarations of the version probe, valid for every libnghttp2 release.
+	 * @since 1.2.0
+	 */
 	private const PROBE_CDEF = <<<'C'
 		typedef struct { int age; int version_num; const char *version_str; const char *proto_str; } nghttp2_info;
 		nghttp2_info *nghttp2_version(int least_version);
@@ -181,6 +187,7 @@ final class TNgHttp2
 		int nghttp2_submit_ping(nghttp2_session *session, uint8_t flags, const uint8_t *opaque_data);
 		int nghttp2_submit_window_update(nghttp2_session *session, uint8_t flags, int32_t stream_id, int32_t window_size_increment);
 		int nghttp2_session_consume(nghttp2_session *session, int32_t stream_id, size_t size);
+		int nghttp2_session_consume_connection(nghttp2_session *session, size_t size);
 		uint32_t nghttp2_session_get_remote_settings(nghttp2_session *session, int id);
 		uint32_t nghttp2_session_get_local_settings(nghttp2_session *session, int id);
 		int32_t nghttp2_session_get_stream_remote_window_size(nghttp2_session *session, int32_t stream_id);
@@ -274,6 +281,7 @@ final class TNgHttp2
 	 * @param string $candidate The library path or soname.
 	 * @throws \FFI\Exception When the candidate does not load.
 	 * @return array{num: int, str: string} nghttp2's `version_num` and `version_str`.
+	 * @since 1.2.0
 	 */
 	private static function probeVersion(string $candidate): array
 	{
